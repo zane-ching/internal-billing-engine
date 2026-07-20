@@ -1,0 +1,11 @@
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_METRICS_EXPORTER": "otlp",
+    "OTEL_LOGS_EXPORTER": "none",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otel-billing.internal.cyclotron.com:4318",
+    "OTEL_METRIC_EXPORT_INTERVAL": "60000",
+    "OTEL_METRICS_INCLUDE_SESSION_ID": "true"
+  }
+}

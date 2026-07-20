@@ -1,0 +1,11 @@
+.git/
+data/
+otel-data/
+*.db
+.env
+.env.*
+.claude/
+__pycache__/
+*.pyc
+deploy/
+repo_client_map.csv

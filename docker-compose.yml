@@ -1,0 +1,28 @@
+# Host the telemetry receiver.
+#   docker compose up -d --build
+# Data (SQLite store + request log) persists in ./otel-data on the host.
+services:
+  receiver:
+    build: .
+    image: cyclotron/billing-otel-receiver
+    restart: unless-stopped
+    ports:
+      - "4318:4318"          # OTLP/JSON in; front with TLS in production (see below)
+    volumes:
+      - ./otel-data:/data
+    environment:
+      OTEL_DB: /data/otel.db
+      RECEIVER_LOG: /data/receiver.log
+
+  # --- TLS / durability (recommended for production) ------------------------
+  # Dev machines should hit an HTTPS endpoint, not raw :4318. Put a reverse
+  # proxy (Caddy/nginx) or an OpenTelemetry Collector in front, terminating TLS
+  # and forwarding to receiver:4318, then set managed-settings.json's
+  # OTEL_EXPORTER_OTLP_ENDPOINT to that HTTPS URL. Example Caddy sidecar:
+  #
+  # proxy:
+  #   image: caddy:2
+  #   restart: unless-stopped
+  #   ports: ["443:443"]
+  #   command: caddy reverse-proxy --from otel-billing.internal.cyclotron.com --to receiver:4318
+  #   depends_on: [receiver]
