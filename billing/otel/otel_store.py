@@ -1,4 +1,4 @@
-"""SQLite store for OTEL-ingested Claude Code token usage + repo->client map.
+"""SQLite store for OTEL-ingested Claude Code token usage + optional repo-name map.
 
 Claude Code exports token metrics with DELTA temporality by default: each data
 point is an increment. To accumulate correctly and stay idempotent across
@@ -50,15 +50,16 @@ CREATE TABLE IF NOT EXISTS cost_usage (
 );
 CREATE INDEX IF NOT EXISTS ix_cost_repo ON cost_usage(repo);
 
-CREATE TABLE IF NOT EXISTS repo_client_map (
+CREATE TABLE IF NOT EXISTS repo_name_map (
   repo TEXT PRIMARY KEY,            -- normalized repo key
-  client TEXT,                      -- client bucket (you assign manually)
+  bill_name TEXT,                   -- OPTIONAL override billing name
+                                    -- (defaults to the short repo name if absent)
   updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS invoices (
   invoice_number TEXT PRIMARY KEY,
-  client TEXT,
+  bill_name TEXT,                  -- billing entity: the repo name (or its override)
   period_start TEXT,
   period_end TEXT,
   currency TEXT,
@@ -138,26 +139,27 @@ class OtelStore:
              float(cost_usd or 0), _now()))
         return cur.rowcount > 0
 
-    # ---- repo -> client mapping ----------------------------------------
+    # ---- repo -> billing-name override map (optional) ------------------
     def distinct_repos(self):
         return self.db.execute(
             """SELECT t.repo AS repo,
-                      COALESCE(m.client, '') AS client,
+                      COALESCE(m.bill_name, '') AS bill_name,
                       SUM(t.tokens) AS tokens,
                       COUNT(DISTINCT t.user_email) AS users,
                       COUNT(DISTINCT t.session_id) AS sessions
                FROM token_usage t
-               LEFT JOIN repo_client_map m ON m.repo = t.repo
+               LEFT JOIN repo_name_map m ON m.repo = t.repo
                GROUP BY t.repo ORDER BY tokens DESC""").fetchall()
 
-    def set_mapping(self, repo: str, client: str):
+    def set_mapping(self, repo: str, bill_name: str):
         self.db.execute(
-            "INSERT OR REPLACE INTO repo_client_map(repo,client,updated_at) VALUES(?,?,?)",
-            (repo, client, _now()))
+            "INSERT OR REPLACE INTO repo_name_map(repo,bill_name,updated_at) VALUES(?,?,?)",
+            (repo, bill_name, _now()))
 
     def get_mapping(self) -> dict:
-        return {r["repo"]: r["client"]
-                for r in self.db.execute("SELECT repo, client FROM repo_client_map")}
+        """repo -> override billing name (only rows that have been overridden)."""
+        return {r["repo"]: r["bill_name"]
+                for r in self.db.execute("SELECT repo, bill_name FROM repo_name_map")}
 
     def commit(self):
         self.db.commit()

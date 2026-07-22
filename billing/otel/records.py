@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import argparse
 
+from .normalize import repo_name
 from .otel_store import OtelStore
 
 
 def run(db: str | None = None, repo_filter: str | None = None, limit: int | None = None):
     store = OtelStore(db) if db else OtelStore()
     mapping = store.get_mapping()
+    name_of = lambda repo: mapping.get(repo) or repo_name(repo)
 
     sql = ("SELECT ts, repo, repo_raw, user_email, model, token_type, tokens, "
            "session_id FROM token_usage")
@@ -31,15 +33,14 @@ def run(db: str | None = None, repo_filter: str | None = None, limit: int | None
         params.append(limit)
     rows = store.db.execute(sql, params).fetchall()
 
-    print(f"{'repo':<34}{'client':<13}{'user':<16}{'model':<18}"
+    print(f"{'repo':<34}{'bill_name':<20}{'user':<16}{'model':<18}"
           f"{'type':<14}{'tokens':>12}")
-    print("-" * 107)
+    print("-" * 114)
     for r in rows:
-        client = mapping.get(r["repo"]) or "(unassigned)"
         user = (r["user_email"] or "").split("@")[0]
-        print(f"{r['repo']:<34}{client:<13}{user:<16}{r['model']:<18}"
+        print(f"{r['repo']:<34}{name_of(r['repo']):<20}{user:<16}{r['model']:<18}"
               f"{r['token_type']:<14}{r['tokens']:>12,}")
-    print("-" * 107)
+    print("-" * 114)
     print(f"{len(rows)} records")
 
     # show one record fully expanded so every tagged attribute is visible
@@ -48,7 +49,7 @@ def run(db: str | None = None, repo_filter: str | None = None, limit: int | None
         print("\nOne record, all fields:")
         for k in r.keys():
             print(f"  {k:<12} {r[k]}")
-        print(f"  {'client':<12} {mapping.get(r['repo']) or '(unassigned)'}")
+        print(f"  {'bill_name':<12} {name_of(r['repo'])}")
     store.close()
 
 

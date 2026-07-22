@@ -1,1 +1,1 @@
-"""OTEL path: ingest Claude Code telemetry, attribute to repos, bill clients."""
+"""OTEL path: ingest Claude Code telemetry, attribute to repos, bill per repo."""

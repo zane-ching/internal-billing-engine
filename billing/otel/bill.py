@@ -1,9 +1,12 @@
-"""Aggregate OTEL-attributed usage into a per-client bill.
+"""Aggregate OTEL-attributed usage into a per-repo bill.
+
+Usage bills to the repo it was done in (the short repo name); an optional
+override map can rename or group repos (see billing.otel.repos).
 
 Bills on Claude Code's own reported cost (`claude_code.cost.usage`) — the
 actual USD Anthropic charges — marked up. The rate-card estimate (RatingService
-on token counts) is shown alongside as a cross-check. Repos with no client
-assignment land in UNASSIGNED and are called out (unbilled revenue at risk).
+on token counts) is shown alongside as a cross-check. Usage from sessions with
+no git remote lands in the `unknown` bucket and is called out (unattributable).
 
 If no cost data has been captured yet (token-only store), it falls back to the
 rate-card as the billing basis and says so.
@@ -17,11 +20,11 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 
-from .normalize import normalize_model
+from .normalize import normalize_model, repo_name
 from .otel_store import OtelStore
 from .rating import RatingService
 
-UNASSIGNED = "UNASSIGNED"
+UNATTRIBUTED = "unknown"  # sessions with no git remote -> not tied to a repo
 
 
 def ftok(n) -> str:
@@ -43,7 +46,7 @@ def run(db: str | None = None, markup: float = 1.50, basis: str = "actual"):
     store = OtelStore(db) if db else OtelStore()
     rates = RatingService(markup=markup)
     mapping = store.get_mapping()
-    client_of = lambda repo: mapping.get(repo) or UNASSIGNED
+    name_of = lambda repo: mapping.get(repo) or repo_name(repo)
 
     # Actual cost (Anthropic's own figure) per repo x model.
     actual_rows = store.db.execute(
@@ -59,38 +62,38 @@ def run(db: str | None = None, markup: float = 1.50, basis: str = "actual"):
     if basis == "actual" and not have_cost:
         basis = "rates"
 
-    actual_by_client = defaultdict(float)
-    actual_by_client_model = defaultdict(lambda: defaultdict(float))
-    ratecard_by_client = defaultdict(float)
-    ratecard_by_client_model = defaultdict(lambda: defaultdict(float))
-    tokens_by_client = defaultdict(int)
-    repos_by_client = defaultdict(set)
-    unassigned = set()
+    actual_by_name = defaultdict(float)
+    actual_by_name_model = defaultdict(lambda: defaultdict(float))
+    ratecard_by_name = defaultdict(float)
+    ratecard_by_name_model = defaultdict(lambda: defaultdict(float))
+    tokens_by_name = defaultdict(int)
+    repos_by_name = defaultdict(set)
+    unattributed = set()
 
     for r in actual_rows:
-        cl = client_of(r["repo"])
-        actual_by_client[cl] += r["c"] or 0
-        actual_by_client_model[cl][normalize_model(r["model"])] += r["c"] or 0
-        repos_by_client[cl].add(r["repo"])
-        if cl == UNASSIGNED:
-            unassigned.add(r["repo"])
+        nm = name_of(r["repo"])
+        actual_by_name[nm] += r["c"] or 0
+        actual_by_name_model[nm][normalize_model(r["model"])] += r["c"] or 0
+        repos_by_name[nm].add(r["repo"])
+        if r["repo"] == UNATTRIBUTED:
+            unattributed.add(r["repo"])
 
     for r in token_rows:
-        cl = client_of(r["repo"])
+        nm = name_of(r["repo"])
         est = rates.billed(r["model"], r["token_type"], r["tok"]) / markup  # raw, pre-markup
-        ratecard_by_client[cl] += est
-        ratecard_by_client_model[cl][normalize_model(r["model"])] += est
-        tokens_by_client[cl] += r["tok"] or 0
-        repos_by_client[cl].add(r["repo"])
-        if cl == UNASSIGNED:
-            unassigned.add(r["repo"])
+        ratecard_by_name[nm] += est
+        ratecard_by_name_model[nm][normalize_model(r["model"])] += est
+        tokens_by_name[nm] += r["tok"] or 0
+        repos_by_name[nm].add(r["repo"])
+        if r["repo"] == UNATTRIBUTED:
+            unattributed.add(r["repo"])
 
     use_actual = basis == "actual"
-    cost_by_client = actual_by_client if use_actual else ratecard_by_client
-    cost_by_client_model = actual_by_client_model if use_actual else ratecard_by_client_model
+    cost_by_name = actual_by_name if use_actual else ratecard_by_name
+    cost_by_name_model = actual_by_name_model if use_actual else ratecard_by_name_model
 
     print("=" * 68)
-    print("PER-CLIENT BILL  (OTEL repo-attributed Claude Code usage)")
+    print("PER-REPO BILL  (OTEL repo-attributed Claude Code usage)")
     if use_actual:
         print(f"basis: ACTUAL cost from claude_code.cost.usage  x{markup:.2f} markup")
     else:
@@ -99,16 +102,16 @@ def run(db: str | None = None, markup: float = 1.50, basis: str = "actual"):
     print("=" * 68)
 
     grand_basis = grand_billed = 0.0
-    for client in sorted(cost_by_client, key=lambda c: (c == UNASSIGNED, -cost_by_client[c])):
-        base = cost_by_client[client]
+    for name in sorted(cost_by_name, key=lambda c: (c == UNATTRIBUTED, -cost_by_name[c])):
+        base = cost_by_name[name]
         billed = base * markup
         grand_basis += base
         grand_billed += billed
-        print(f"\n{client}")
+        print(f"\n{name}")
         rule()
-        print(f"  repos:  {', '.join(sorted(repos_by_client[client]))}")
-        print(f"  tokens: {ftok(tokens_by_client[client])}")
-        for model, amt in sorted(cost_by_client_model[client].items(), key=lambda x: -x[1]):
+        print(f"  repos:  {', '.join(sorted(repos_by_name[name]))}")
+        print(f"  tokens: {ftok(tokens_by_name[name])}")
+        for model, amt in sorted(cost_by_name_model[name].items(), key=lambda x: -x[1]):
             print(f"    {model:<32} ${amt:>10,.4f}")
         print(f"  {'cost basis':<34} ${base:>10,.4f}")
         print(f"  {'BILLED (x%.2f)' % markup:<34} ${billed:>10,.4f}")
@@ -119,16 +122,15 @@ def run(db: str | None = None, markup: float = 1.50, basis: str = "actual"):
 
     # Cross-check: actual vs rate-card (only meaningful when we have both)
     if have_cost:
-        rc = sum(ratecard_by_client.values())
-        ac = sum(actual_by_client.values())
+        rc = sum(ratecard_by_name.values())
+        ac = sum(actual_by_name.values())
         print(f"\ncross-check  actual=${ac:,.4f}  rate-card=${rc:,.4f}"
               + (f"  (rate-card is {rc/ac:.2f}x actual)" if ac else ""))
 
-    if unassigned:
-        print("\n⚠  UNASSIGNED repos (no client mapping -> not billed to anyone):")
-        for repo in sorted(unassigned):
-            print(f"     - {repo}")
-        print("   Assign them:  repos export → fill client → repos import (or automap)")
+    if unattributed:
+        print("\n⚠  UNATTRIBUTED usage (sessions with no git remote -> no repo):")
+        print("     billed under the 'unknown' bucket; not tied to any repo.")
+        print("   Fix: ensure sessions run inside a git repo so a remote is tagged.")
 
     store.close()
 

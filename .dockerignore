@@ -8,4 +8,4 @@ otel-data/
 __pycache__/
 *.pyc
 deploy/
-repo_client_map.csv
+repo_name_map.csv

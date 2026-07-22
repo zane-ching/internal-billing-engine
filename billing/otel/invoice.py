@@ -1,12 +1,14 @@
-"""Generate per-client invoices for a billing period.
+"""Generate per-repo invoices for a billing period.
 
-For each client with attributed usage in [start, end):
+For each billing name (a repo, or an override that renames/groups repos) with
+attributed usage in [start, end):
   - aggregate actual cost (claude_code.cost.usage) and tokens per repo x model,
   - apply markup,
   - persist an immutable invoice + line items to the store,
   - write a human-readable invoice + CSVs under ./invoices/<start>_<end>/.
 
-Repos with no client mapping (UNASSIGNED) are reported but NOT invoiced.
+Usage from sessions with no git remote (the `unknown` bucket) is reported but
+NOT invoiced.
 
     python -m billing.otel.invoice --start 2026-07-01 --end 2026-08-01 --markup 1.5
 """
@@ -19,10 +21,10 @@ import os
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from .normalize import normalize_model
+from .normalize import normalize_model, repo_name
 from .otel_store import OtelStore
 
-UNASSIGNED = "UNASSIGNED"
+UNATTRIBUTED = "unknown"  # sessions with no git remote -> not tied to a repo
 
 
 def _now() -> str:
@@ -45,9 +47,9 @@ def _in_period(col_table, start, end):
 
 
 def gather(store: OtelStore, start: str, end: str):
-    """Return {client: {(repo, model): {tokens, actual_cost}}} for the period."""
+    """Return {bill_name: {(repo, model): {tokens, actual_cost}}} for the period."""
     mapping = store.get_mapping()
-    client_of = lambda repo: mapping.get(repo) or UNASSIGNED
+    name_of = lambda repo: mapping.get(repo) or repo_name(repo)
 
     # actual cost per repo x model
     cost = defaultdict(float)
@@ -65,27 +67,27 @@ def gather(store: OtelStore, start: str, end: str):
             "GROUP BY repo, model", (start, end)):
         toks[(r["repo"], normalize_model(r["model"]))] += r["t"] or 0
 
-    clients = defaultdict(lambda: defaultdict(lambda: {"tokens": 0, "actual_cost": 0.0}))
+    entities = defaultdict(lambda: defaultdict(lambda: {"tokens": 0, "actual_cost": 0.0}))
     for key in set(cost) | set(toks):
         repo, model = key
-        cl = client_of(repo)
-        clients[cl][(repo, model)] = {
+        nm = name_of(repo)
+        entities[nm][(repo, model)] = {
             "tokens": toks.get(key, 0),
             "actual_cost": cost.get(key, 0.0),
         }
-    return clients
+    return entities
 
 
-def persist_invoice(store, invoice_number, client, start, end, markup,
+def persist_invoice(store, invoice_number, bill_name, start, end, markup,
                     line_items, actual_cost, tokens, total_billed):
     store.db.execute("DELETE FROM invoice_line_items WHERE invoice_number = ?",
                      (invoice_number,))
     store.db.execute(
         """INSERT OR REPLACE INTO invoices
-           (invoice_number, client, period_start, period_end, currency,
+           (invoice_number, bill_name, period_start, period_end, currency,
             actual_cost, markup, total_billed, tokens, status, generated_at)
            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-        (invoice_number, client, start, end, "USD", actual_cost, markup,
+        (invoice_number, bill_name, start, end, "USD", actual_cost, markup,
          total_billed, tokens, "draft", _now()))
     for li in line_items:
         store.db.execute(
@@ -97,7 +99,7 @@ def persist_invoice(store, invoice_number, client, start, end, markup,
     store.commit()
 
 
-def write_invoice_text(path, invoice_number, client, start, end, markup,
+def write_invoice_text(path, invoice_number, bill_name, start, end, markup,
                        line_items, actual_cost, tokens, total_billed):
     W = 104
     money = lambda x: f"${x:,.4f}"
@@ -106,7 +108,7 @@ def write_invoice_text(path, invoice_number, client, start, end, markup,
     lines.append("CYCLOTRON — Claude Usage Invoice")
     lines.append("=" * W)
     lines.append(f"Invoice #:  {invoice_number}")
-    lines.append(f"Client:     {client}")
+    lines.append(f"Repo:       {bill_name}")
     lines.append(f"Period:     {start}  →  {end}")
     lines.append(f"Generated:  {_now()}")
     lines.append("Status:     DRAFT")
@@ -131,14 +133,14 @@ def run(start: str, end: str, markup: float = 1.50, db: str | None = None,
     out_dir = out_dir or os.path.join("invoices", f"{start}_{end}")
     os.makedirs(out_dir, exist_ok=True)
 
-    clients = gather(store, start, end)
+    entities = gather(store, start, end)
 
     summary_rows = []
     all_line_items = []
     print(f"Generating invoices for {start} → {end}  (markup x{markup:.2f})\n")
 
-    for client in sorted(c for c in clients if c != UNASSIGNED):
-        items = clients[client]
+    for bill_name in sorted(c for c in entities if c != UNATTRIBUTED):
+        items = entities[bill_name]
         line_items = []
         actual_cost = 0.0
         tokens = 0
@@ -150,23 +152,23 @@ def run(start: str, end: str, markup: float = 1.50, db: str | None = None,
             actual_cost += v["actual_cost"]
             tokens += v["tokens"]
         total_billed = actual_cost * markup
-        invoice_number = f"INV-{start}-{client}"
+        invoice_number = f"INV-{start}-{bill_name}"
 
-        persist_invoice(store, invoice_number, client, start, end, markup,
+        persist_invoice(store, invoice_number, bill_name, start, end, markup,
                         line_items, actual_cost, tokens, total_billed)
         text_path = os.path.join(out_dir, f"{invoice_number}.txt")
-        write_invoice_text(text_path, invoice_number, client, start, end, markup,
+        write_invoice_text(text_path, invoice_number, bill_name, start, end, markup,
                            line_items, actual_cost, tokens, total_billed)
 
         summary_rows.append({
-            "invoice_number": invoice_number, "client": client,
+            "invoice_number": invoice_number, "bill_name": bill_name,
             "period_start": start, "period_end": end, "tokens": tokens,
             "actual_cost_usd": round(actual_cost, 6), "markup": markup,
             "total_billed_usd": round(total_billed, 6),
         })
         for li in line_items:
             all_line_items.append({
-                "invoice_number": invoice_number, "client": client,
+                "invoice_number": invoice_number, "bill_name": bill_name,
                 "repo": li["repo"], "model": li["model"], "tokens": li["tokens"],
                 "actual_cost_usd": round(li["actual_cost"], 6),
                 "billed_usd": round(li["billed"], 6),
@@ -177,35 +179,33 @@ def run(start: str, end: str, markup: float = 1.50, db: str | None = None,
     # CSVs
     summary_csv = os.path.join(out_dir, "summary.csv")
     with open(summary_csv, "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=["invoice_number", "client",
+        w = csv.DictWriter(fh, fieldnames=["invoice_number", "bill_name",
             "period_start", "period_end", "tokens", "actual_cost_usd", "markup",
             "total_billed_usd"])
         w.writeheader()
         w.writerows(summary_rows)
     line_csv = os.path.join(out_dir, "line_items.csv")
     with open(line_csv, "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=["invoice_number", "client", "repo",
+        w = csv.DictWriter(fh, fieldnames=["invoice_number", "bill_name", "repo",
             "model", "tokens", "actual_cost_usd", "billed_usd"])
         w.writeheader()
         w.writerows(all_line_items)
 
     grand = sum(r["total_billed_usd"] for r in summary_rows)
     print(f"\n{len(summary_rows)} invoice(s), grand total billed ${grand:,.4f}")
-    print(f"Written to {out_dir}/  (per-client .txt, summary.csv, line_items.csv)")
+    print(f"Written to {out_dir}/  (per-repo .txt, summary.csv, line_items.csv)")
 
-    # UNASSIGNED report (not invoiced)
-    if UNASSIGNED in clients:
-        un_cost = sum(v["actual_cost"] for v in clients[UNASSIGNED].values())
-        repos = sorted({repo for (repo, _m) in clients[UNASSIGNED]})
-        print(f"\n⚠  UNINVOICED (no client mapping): ${un_cost:,.4f} actual cost across "
-              f"{len(repos)} repo(s): {', '.join(repos)}")
-        print("   Map them (repos automap / import) and re-run to capture this revenue.")
+    # Unattributed report (not invoiced): sessions with no git remote.
+    if UNATTRIBUTED in entities:
+        un_cost = sum(v["actual_cost"] for v in entities[UNATTRIBUTED].values())
+        print(f"\n⚠  UNINVOICED (no git remote → 'unknown'): ${un_cost:,.4f} actual cost.")
+        print("   Ensure sessions run inside a git repo so usage carries a repo tag.")
 
     store.close()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Generate per-client invoices.")
+    ap = argparse.ArgumentParser(description="Generate per-repo invoices.")
     ap.add_argument("--start", required=True, help="period start YYYY-MM-DD (inclusive)")
     ap.add_argument("--end", required=True, help="period end YYYY-MM-DD (exclusive)")
     ap.add_argument("--markup", type=float, default=1.50)

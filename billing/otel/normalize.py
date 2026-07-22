@@ -35,6 +35,22 @@ def normalize_model(model: str | None) -> str:
     return m.strip() or "unknown"
 
 
+def repo_name(repo: str | None) -> str:
+    """Short billing name for a repo: the last path segment of the normalized key.
+
+        github.com/cyclotron/acme-web -> acme-web
+        github.com/cyclotron/globex-api -> globex-api
+
+    This is the billing identity. There is no <client>- prefix parsing — usage
+    bills to the repo it was done in. (An optional override map can rename or
+    group repos; see billing.otel.repos.)
+    """
+    if not repo or repo == "unknown":
+        return "unknown"
+    name = repo.rstrip("/").split("/")[-1].strip().lower()
+    return name or "unknown"
+
+
 def normalize_remote(raw: str | None) -> str:
     if not raw:
         return "unknown"

@@ -51,7 +51,7 @@ claude --version              # confirms CLI present
 Deployed as the `claude` entrypoint so every CLI session is stamped with its
 git remote (`OTEL_RESOURCE_ATTRIBUTES=repo=<remote>`). The receiver normalizes
 that remote and maps it to a client. Sessions started outside a git repo tag as
-`repo=unknown` and surface as UNASSIGNED (flagged, never silently mis-billed).
+`repo=unknown` and surface in the `unknown` bucket (flagged, never silently mis-billed).
 
 > The VS Code extension does **not** export OTEL telemetry, so repo-attributed
 > billing standardizes on CLI usage. Direct developers to use the `claude` CLI.
@@ -105,4 +105,4 @@ docker compose up -d --build     # from the repo root
 - **Backups** — back up `./otel-data/otel.db`; it's the source of billing truth.
 
 Then run the billing loop against the store the receiver writes:
-`repos automap → bill → reconcile` (see the top-level README).
+`bill → reconcile → invoice` (see the top-level README).

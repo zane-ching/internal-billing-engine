@@ -1,2 +1,2 @@
-repo,client,tokens,users,sessions
-github.com/zane-ching/internal-billing-engine,internal,30084986,1,2
+repo,bill_name,tokens,users,sessions
+github.com/zane-ching/internal-billing-engine,internal-billing-engine,30084986,1,2
