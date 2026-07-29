@@ -1,20 +1,39 @@
 # internal-billing-engine
 
-Backend engine that attributes Cyclotron employees' Claude usage to the repository it was done in, and turns that into per-repo bills (one client project = one repo). Usage bills to the repo it was done in — there are no naming rules to configure; an optional override map can rename or group repos.
+Backend engine to obtain Claude Code usage data and its link with its associated GitHub repositories. Attributes Cyclotron employees' Claude usage to the repository it was done in, and in turn to the client it was done for. 
+
+Can run locally because of .claude > settings.local.json, settings (deploy/) will have to be pushed to all dev machines in order for global telemetry to be captured.
+
+## 1: Receiving telemetry data
+The engine gets data via an OTLP/JSON receiver (receiver.py) that ingests telemetry emitted by Claude Code on each dev machine. Deduped datapoints are stored in a single-host SQLite database. 
+
+## 2: Push data to ADLS
+A scheduler (scheduler.py) regenerates two flat all-history CSVs (claudeuseagesummary, claudeusagelineitems) and enqueues them. Sync worker (fabric_sync.py) drains outbox and uploads to ADLS (rg-cyclotron-insights > sacyclotroninsights > cyclotroninsights), overwriting each file. Scheduled daily but can be modified (SYNC_FREQUENCY in .env).
+
+## 3: Load into Fabric as Delta tables
+Connection through service principal allows for shortcut into CyclotronInsights workspace's lake_insights_db lakehouse > Files. claude-billing-push notebook scheduled to lake_insights_db > Tables as claudeusagesummary and claudeusagelineitems.
+
+## 4: Generate invoices/reports
+NOT BUILT OUT YET; need to create repo --> client mapping table (manually), aggregate by client, and generate monthly invoices.
 
 ## Folder layout
 
 ```
 billing/            Python package — both pipelines + reconciliation
   otel/             the OTEL (repo-level) path
-data/               generated SQLite stores + logs (gitignored)
 deploy/             client-side config pushed to dev machines (MDM)
+fabric/             Fabric-side notebook + docs (CSV → Delta tables)
+data/               generated SQLite stores + logs (gitignored)
 .claude/            local Claude Code settings (gitignored)
+Dockerfile          container image for the receiver
+docker-compose.yml  receiver + sync worker services
+DEMO.md             end-to-end demo runbook
 ```
 
 ### `billing/` — the engine
 
 Shared:
+- **`__init__.py`** — marks `billing/` (and `billing/otel/`) as Python packages; no code.
 - **`config.py`** — loads `.env` into the environment so tools find the API token.
 
 **Analytics path (per-user):**
@@ -71,6 +90,34 @@ Shared:
 
 - **`settings.local.json`** — personal telemetry config used when testing this
   machine as a telemetry source (points Claude Code at a local receiver).
+
+### `fabric/` — Fabric-side (CSV → running Delta tables)
+
+The engine pushes two flat, all-history CSVs to ADLS; these turn them into
+queryable Delta tables inside Microsoft Fabric.
+
+- **`README.md`** — the Fabric setup runbook: shortcut the CSVs into **Files**
+  (not Tables), then convert each into a Delta table (one-off in the UI, or the
+  scheduled notebook below).
+- **`refresh_billing_tables.py`** — Fabric notebook cell that overwrites both
+  Delta tables (`claudeusagesummary`, `claudeusagelineitems`) from the full-history
+  CSVs each run; schedule it to fire shortly after the sync job.
+
+### Container & compose
+
+- **`Dockerfile`** — image for the telemetry receiver (stdlib-only, `python:3.12-slim`);
+  persists the store + request log on a mounted `/data` volume, exposes `4318`.
+- **`docker-compose.yml`** — hosts the `receiver` service plus the long-running
+  `sync` worker (self-pacing scheduler shipping CSVs to the lake), sharing one
+  `./otel-data` volume; includes a commented Caddy TLS sidecar for production.
+- **`.dockerignore`** — keeps secrets, data, and local settings out of the build context.
+
+### Demo & repo hygiene
+
+- **`DEMO.md`** — end-to-end demo runbook: a live Claude Code session → repo-tagged
+  telemetry → captured → per-repo invoice, plus talking points and quick fixes.
+- **`.gitignore`** — excludes secrets (`.env*`), generated data/stores, invoices,
+  and personal `.claude` settings from version control.
 
 ---
 
