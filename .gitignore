@@ -18,4 +18,5 @@ venv/
 
 # Generated billing output
 invoices/
+exports/
 otel-data/

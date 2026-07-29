@@ -14,6 +14,25 @@ services:
       OTEL_DB: /data/otel.db
       RECEIVER_LOG: /data/receiver.log
 
+  # Sync worker: refresh the current month's invoices + ship CSVs to external
+  # storage (ADLS Gen2 / OneLake), self-pacing at the cadence in SYNC_FREQUENCY
+  # (hourly/daily/weekly/monthly). Long-running; shares the receiver's volume so
+  # it reads the same otel.db. Config + auth come from .env (see .env.example).
+  #
+  # Prefer precise cron timing instead? Drop `--loop`, keep this out of `up`, and
+  # fire `docker compose run --rm sync` from cron (see: scheduler --emit-cron).
+  sync:
+    build: .
+    image: cyclotron/billing-otel-receiver
+    restart: unless-stopped
+    volumes:
+      - ./otel-data:/data
+    env_file:
+      - .env
+    environment:
+      OTEL_DB: /data/otel.db
+    command: ["python", "-m", "billing.otel.scheduler", "--loop"]
+
   # --- TLS / durability (recommended for production) ------------------------
   # Dev machines should hit an HTTPS endpoint, not raw :4318. Put a reverse
   # proxy (Caddy/nginx) or an OpenTelemetry Collector in front, terminating TLS

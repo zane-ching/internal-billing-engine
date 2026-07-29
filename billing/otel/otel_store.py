@@ -80,6 +80,26 @@ CREATE TABLE IF NOT EXISTS invoice_line_items (
 );
 CREATE INDEX IF NOT EXISTS ix_lineitem_inv ON invoice_line_items(invoice_number);
 
+-- Durable outbox for asynchronous delivery of invoice CSVs to Fabric OneLake.
+-- invoice.py enqueues a 'pending' row per file; billing.otel.fabric_sync ships
+-- it with retry/backoff and flips it to 'sent'. Nothing is lost on a crash.
+CREATE TABLE IF NOT EXISTS fabric_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT,                       -- 'summary' | 'line_items'
+  period_start TEXT,
+  period_end TEXT,
+  local_path TEXT,                 -- source CSV on disk
+  onelake_path TEXT,               -- destination path under the Lakehouse's Files/
+  table_name TEXT,                 -- optional Delta table to load into ('' = files only)
+  status TEXT,                     -- pending | sent | failed
+  attempts INTEGER DEFAULT 0,
+  next_attempt_at TEXT,            -- earliest UTC time to (re)try
+  last_error TEXT,
+  enqueued_at TEXT,
+  sent_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_outbox_status ON fabric_outbox(status, next_attempt_at);
+
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -160,6 +180,58 @@ class OtelStore:
         """repo -> override billing name (only rows that have been overridden)."""
         return {r["repo"]: r["bill_name"]
                 for r in self.db.execute("SELECT repo, bill_name FROM repo_name_map")}
+
+    # ---- Fabric delivery outbox (async) --------------------------------
+    def fabric_enqueue(self, *, kind, period_start, period_end, local_path,
+                       onelake_path, table_name=""):
+        """Queue one file for delivery. Re-queues cleanly on re-run: any not-yet-
+        sent row for the same (kind, period) is replaced so we never pile up
+        duplicate pending deliveries."""
+        self.db.execute(
+            """DELETE FROM fabric_outbox
+               WHERE kind=? AND period_start=? AND period_end=? AND status!='sent'""",
+            (kind, period_start, period_end))
+        self.db.execute(
+            """INSERT INTO fabric_outbox
+               (kind, period_start, period_end, local_path, onelake_path,
+                table_name, status, attempts, next_attempt_at, enqueued_at)
+               VALUES (?,?,?,?,?,?, 'pending', 0, ?, ?)""",
+            (kind, period_start, period_end, local_path, onelake_path,
+             table_name, _now(), _now()))
+        self.db.commit()
+
+    def fabric_pending(self, now_iso: str, max_attempts: int = 5):
+        """Rows due for a delivery attempt now (pending and not backing off,
+        under the attempt ceiling)."""
+        return self.db.execute(
+            """SELECT * FROM fabric_outbox
+               WHERE status='pending' AND attempts < ?
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+               ORDER BY id""", (max_attempts, now_iso)).fetchall()
+
+    def fabric_mark_sent(self, row_id: int):
+        self.db.execute(
+            "UPDATE fabric_outbox SET status='sent', sent_at=?, last_error=NULL "
+            "WHERE id=?", (_now(), row_id))
+        self.db.commit()
+
+    def fabric_mark_retry(self, row_id: int, error: str, next_attempt_at: str,
+                          max_attempts: int = 5):
+        """Record a failed attempt; keep 'pending' for another try, or flip to
+        'failed' once the attempt ceiling is reached."""
+        self.db.execute(
+            """UPDATE fabric_outbox
+               SET attempts = attempts + 1,
+                   last_error = ?,
+                   next_attempt_at = ?,
+                   status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE 'pending' END
+               WHERE id=?""",
+            (error[:2000], next_attempt_at, max_attempts, row_id))
+        self.db.commit()
+
+    def fabric_outbox_counts(self) -> dict:
+        return {r["status"]: r["n"] for r in self.db.execute(
+            "SELECT status, COUNT(*) n FROM fabric_outbox GROUP BY status")}
 
     def commit(self):
         self.db.commit()

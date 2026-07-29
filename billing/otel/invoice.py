@@ -201,6 +201,8 @@ def run(start: str, end: str, markup: float = 1.50, db: str | None = None,
         print(f"\n⚠  UNINVOICED (no git remote → 'unknown'): ${un_cost:,.4f} actual cost.")
         print("   Ensure sessions run inside a git repo so usage carries a repo tag.")
 
+    # (Data-lake delivery is handled separately by billing.otel.export /
+    #  billing.otel.scheduler as running, all-history tables — not per-period files.)
     store.close()
 
 
