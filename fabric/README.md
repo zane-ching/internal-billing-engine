@@ -39,5 +39,10 @@ tables stay current with no duplicates.
 
 Two running Delta tables, queryable from the SQL endpoint / Power BI:
 
-- **`claudeusagesummary`** — `period_start, period_end, bill_name, tokens, actual_cost_usd, markup, total_billed_usd, generated_at`
-- **`claudeusagelineitems`** — `period_start, period_end, bill_name, repo, model, tokens, actual_cost_usd, billed_usd, generated_at`
+- **`claudeusagesummary`** — `period_start, period_end, bill_name, user_email, tokens, actual_cost_usd, markup, total_billed_usd, generated_at`
+- **`claudeusagelineitems`** — `period_start, period_end, bill_name, repo, model, user_email, tokens, actual_cost_usd, billed_usd, generated_at`
+
+`user_email` is the employee whose Claude Code session produced the usage
+(`unknown` if the datapoint arrived without a user attribute). Both tables are
+grained by it, so a repo with several developers now yields one row per developer
+— aggregate it away in the semantic model to get the per-repo billing total.
