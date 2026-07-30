@@ -15,6 +15,8 @@ Connection through service principal allows for shortcut into CyclotronInsights 
 
 ## 4: Generate invoices/reports
 NOT BUILT OUT YET; need to create repo --> client mapping table (manually), aggregate by client, and generate monthly invoices.
+- MAPPING TABLE: https://cyclotron-my.sharepoint.com/:x:/p/zane_ching/IQAmpiRQlK8hQqW8CXAGeqYlAd4Ip-Yx8hDdjhva87tv6rs?e=xfOWfi
+- connected with Fabric through dataflow, updated daily @ 23:59 PST
 
 ## Folder layout
 
