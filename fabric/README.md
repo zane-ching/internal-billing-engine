@@ -39,10 +39,27 @@ tables stay current with no duplicates.
 
 Two running Delta tables, queryable from the SQL endpoint / Power BI:
 
-- **`claudeusagesummary`** — `period_start, period_end, bill_name, user_email, tokens, actual_cost_usd, markup, total_billed_usd, generated_at`
-- **`claudeusagelineitems`** — `period_start, period_end, bill_name, repo, model, user_email, tokens, actual_cost_usd, billed_usd, generated_at`
+- **`claudeusagesummary`** — `usage_date_utc, period_start, period_end, bill_name, user_email, tokens, actual_cost_usd, markup, total_billed_usd, first_usage_at_utc, last_usage_at_utc, generated_at`
+- **`claudeusagelineitems`** — `usage_date_utc, period_start, period_end, bill_name, repo, model, user_email, tokens, actual_cost_usd, billed_usd, first_usage_at_utc, last_usage_at_utc, generated_at`
 
 `user_email` is the employee whose Claude Code session produced the usage
 (`unknown` if the datapoint arrived without a user attribute). Both tables are
 grained by it, so a repo with several developers now yields one row per developer
 — aggregate it away in the semantic model to get the per-repo billing total.
+
+### The date columns
+
+- **`usage_date_utc`** — the UTC day the usage actually happened. This is the finest
+  time grain in the tables; both are grained by it, so one repo-month becomes one
+  row per active day per user.
+- **`first_usage_at_utc` / `last_usage_at_utc`** — UTC timestamps of the earliest and
+  latest datapoint rolled into that row, so intra-day timing survives the
+  aggregation without a row per datapoint.
+- **`period_start` / `period_end`** — the calendar month the row bills to.
+  Redundant with `usage_date_utc` (derivable from it) but kept so a monthly invoice
+  total is a plain `GROUP BY period_start` with no date maths.
+- **`generated_at`** — when the snapshot was built. Pipeline metadata, restamped
+  on every row each sync; **not** a usage time.
+
+All timestamps are UTC — a late-evening session in a western timezone lands on the
+next `usage_date_utc`. Convert in the semantic model if you need local-day reporting.

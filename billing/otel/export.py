@@ -3,14 +3,21 @@
 Two flat, all-history CSVs — NOT partitioned into per-period folders — so Fabric
 loads each as a single running table that accumulates records across months:
 
-    claudeusagesummary.csv     one row per (usage month, bill_name, user_email)
-    claudeusagelineitems.csv   one row per (usage month, repo, model, user_email)
+    claudeusagesummary.csv     one row per (usage date, repo, user_email)
+    claudeusagelineitems.csv   one row per (usage date, repo, model, user_email)
 
-Each row carries the usage month as columns (period_start / period_end) plus
-generated_at (when the snapshot was produced) — so the date lives IN the table,
-not in the folder path. Regenerated in full from the store on every sync and
-written to a STABLE path, so Fabric can load-to-table with OVERWRITE and always
-get the complete, de-duplicated history.
+`repo` is the short billing name (the last path segment, or an override from the
+repo_name_map); the line-item table also carries `repo_key`, the full canonical
+key, so same-named repos in different orgs stay distinguishable.
+
+Each row carries WHEN the usage happened — usage_date_utc (the day) plus the
+first_usage_at_utc / last_usage_at_utc timestamps bounding that day's activity —
+and the calendar month it bills to (period_start / period_end), so a monthly
+rollup is just a GROUP BY. All three are UTC, as emitted by Claude Code.
+generated_at is unrelated to usage: it records when the snapshot was produced.
+Regenerated in full from the store on every sync and written to a STABLE path, so
+Fabric can load-to-table with OVERWRITE and always get the complete,
+de-duplicated history.
 """
 
 from __future__ import annotations
@@ -25,10 +32,12 @@ from .otel_store import OtelStore
 SUMMARY_TABLE = "claudeusagesummary"
 LINEITEMS_TABLE = "claudeusagelineitems"
 
-SUMMARY_FIELDS = ["period_start", "period_end", "bill_name", "user_email", "tokens",
-                  "actual_cost_usd", "markup", "total_billed_usd", "generated_at"]
-LINE_FIELDS = ["period_start", "period_end", "bill_name", "repo", "model", "user_email",
-               "tokens", "actual_cost_usd", "billed_usd", "generated_at"]
+SUMMARY_FIELDS = ["usage_date_utc", "period_start", "period_end", "repo", "user_email",
+                  "tokens", "actual_cost_usd", "markup", "total_billed_usd",
+                  "first_usage_at_utc", "last_usage_at_utc", "generated_at"]
+LINE_FIELDS = ["usage_date_utc", "period_start", "period_end", "repo", "repo_key", "model",
+               "user_email", "tokens", "actual_cost_usd", "billed_usd",
+               "first_usage_at_utc", "last_usage_at_utc", "generated_at"]
 
 UNKNOWN_USER = "unknown"  # datapoints that arrived without a user.email attribute
 
@@ -45,50 +54,72 @@ def _month_end(ym: str) -> str:
 
 def build(store: OtelStore, markup: float):
     """Return (summary_rows, line_rows) covering ALL usage in the store,
-    aggregated per calendar month × repo/model × user."""
+    aggregated per usage DAY × repo/model × user."""
     mapping = store.get_mapping()
     name_of = lambda repo: mapping.get(repo) or repo_name(repo)
 
+    # first/last datapoint time per key, merged across both source tables.
+    span: dict = {}
+
+    def _span(key, lo, hi):
+        cur = span.get(key)
+        if cur is None:
+            span[key] = [lo, hi]
+        else:
+            cur[0] = min(cur[0], lo)
+            cur[1] = max(cur[1], hi)
+
     cost = {}
     for r in store.db.execute(
-            "SELECT substr(ts,1,7) ym, repo, model, user_email, SUM(cost_usd) c "
-            "FROM cost_usage GROUP BY ym, repo, model, user_email"):
-        cost[(r["ym"], r["repo"], normalize_model(r["model"]),
-              r["user_email"] or UNKNOWN_USER)] = r["c"] or 0.0
+            "SELECT substr(ts,1,10) d, repo, model, user_email, SUM(cost_usd) c, "
+            "MIN(ts) lo, MAX(ts) hi "
+            "FROM cost_usage GROUP BY d, repo, model, user_email"):
+        key = (r["d"], r["repo"], normalize_model(r["model"]),
+               r["user_email"] or UNKNOWN_USER)
+        cost[key] = r["c"] or 0.0
+        _span(key, r["lo"], r["hi"])
 
     toks = {}
     for r in store.db.execute(
-            "SELECT substr(ts,1,7) ym, repo, model, user_email, SUM(tokens) t "
-            "FROM token_usage GROUP BY ym, repo, model, user_email"):
-        toks[(r["ym"], r["repo"], normalize_model(r["model"]),
-              r["user_email"] or UNKNOWN_USER)] = r["t"] or 0
+            "SELECT substr(ts,1,10) d, repo, model, user_email, SUM(tokens) t, "
+            "MIN(ts) lo, MAX(ts) hi "
+            "FROM token_usage GROUP BY d, repo, model, user_email"):
+        key = (r["d"], r["repo"], normalize_model(r["model"]),
+               r["user_email"] or UNKNOWN_USER)
+        toks[key] = r["t"] or 0
+        _span(key, r["lo"], r["hi"])
 
     gen = _now_iso()
     line_rows = []
-    summ: dict = {}  # (ym, bill_name, user_email) -> [tokens, cost]
+    summ: dict = {}  # (day, repo, user_email) -> [tokens, cost, first, last]
     for key in sorted(set(cost) | set(toks)):
-        ym, repo, model, user = key
+        day, repo_key, model, user = key
         c = cost.get(key, 0.0)
         t = toks.get(key, 0)
-        bn = name_of(repo)
-        ps, pe = f"{ym}-01", _month_end(ym)
+        lo, hi = span[key]
+        bn = name_of(repo_key)
+        ps, pe = f"{day[:7]}-01", _month_end(day[:7])
         line_rows.append({
-            "period_start": ps, "period_end": pe, "bill_name": bn,
-            "repo": repo, "model": model, "user_email": user, "tokens": t,
-            "actual_cost_usd": round(c, 6), "billed_usd": round(c * markup, 6),
-            "generated_at": gen})
-        agg = summ.setdefault((ym, bn, user), [0, 0.0])
+            "usage_date_utc": day, "period_start": ps, "period_end": pe,
+            "repo": bn, "repo_key": repo_key, "model": model, "user_email": user,
+            "tokens": t, "actual_cost_usd": round(c, 6),
+            "billed_usd": round(c * markup, 6),
+            "first_usage_at_utc": lo, "last_usage_at_utc": hi, "generated_at": gen})
+        agg = summ.setdefault((day, bn, user), [0, 0.0, lo, hi])
         agg[0] += t
         agg[1] += c
+        agg[2] = min(agg[2], lo)
+        agg[3] = max(agg[3], hi)
 
     summary_rows = []
-    for (ym, bn, user), (t, c) in sorted(summ.items()):
-        ps, pe = f"{ym}-01", _month_end(ym)
+    for (day, bn, user), (t, c, lo, hi) in sorted(summ.items()):
+        ps, pe = f"{day[:7]}-01", _month_end(day[:7])
         summary_rows.append({
-            "period_start": ps, "period_end": pe, "bill_name": bn,
-            "user_email": user, "tokens": t, "actual_cost_usd": round(c, 6),
-            "markup": markup, "total_billed_usd": round(c * markup, 6),
-            "generated_at": gen})
+            "usage_date_utc": day, "period_start": ps, "period_end": pe,
+            "repo": bn, "user_email": user, "tokens": t,
+            "actual_cost_usd": round(c, 6), "markup": markup,
+            "total_billed_usd": round(c * markup, 6),
+            "first_usage_at_utc": lo, "last_usage_at_utc": hi, "generated_at": gen})
     return summary_rows, line_rows
 
 

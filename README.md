@@ -147,11 +147,15 @@ fabric_sync → drains the outbox → uploads to ADLS Gen2 / OneLake (retry + ba
 
 - **The two tables** (each a single flat CSV, no date folders, so Fabric loads it
   as one running table):
-  - `claudeusagesummary.csv` — one row per (usage month, repo/bill_name, user_email)
-  - `claudeusagelineitems.csv` — one row per (usage month, repo, model, user_email)
-- **Date is a column, not a folder:** each row carries `period_start` / `period_end`
-  (the usage month) and `generated_at` (when the snapshot was produced), so records
-  accumulate across months in one table.
+  - `claudeusagesummary.csv` — one row per (usage date, repo/bill_name, user_email)
+  - `claudeusagelineitems.csv` — one row per (usage date, repo, model, user_email)
+- **Date is a column, not a folder:** each row carries `usage_date_utc` (the UTC day
+  the usage happened, the finest time grain), `first_usage_at_utc` /
+  `last_usage_at_utc` (the timestamps bounding that day's activity for the row —
+  also UTC, per the `_utc` suffix), `period_start` / `period_end`
+  (the calendar month it bills to — a monthly rollup is just a `GROUP BY`), and
+  `generated_at` (when the snapshot was produced, *not* a usage time). Records
+  accumulate across days and months in one table.
 - **Where it lands:** `<prefix>/claudeusagesummary.csv` and
   `<prefix>/claudeusagelineitems.csv` in the configured container. Regenerated in
   full each sync and overwritten → Fabric loads-to-table with **overwrite**, always
