@@ -14,7 +14,7 @@ A scheduler (scheduler.py) regenerates two flat all-history CSVs (claudeuseagesu
 Connection through service principal allows for shortcut into CyclotronInsights workspace's lake_insights_db lakehouse > Files. claude-billing-push notebook scheduled to lake_insights_db > Tables as claudeusagesummary and claudeusagelineitems.
 
 ## 4: Generate invoices/reports
-NOT BUILT OUT YET; need to create repo --> client mapping table (manually), aggregate by client, and generate monthly invoices.
+Notebook in CyclotronInsights workspace in Fabric filters claudeusagelineitems by period_start and period_end (month), joins with repoclientmap, transforms it by aggregating tokens/cost group by client, repo, and model, and produces itemized invoice.
 - MAPPING TABLE: https://cyclotron-my.sharepoint.com/:x:/p/zane_ching/IQAmpiRQlK8hQqW8CXAGeqYlAd4Ip-Yx8hDdjhva87tv6rs?e=xfOWfi
 - connected with Fabric through dataflow, updated daily @ 23:59 PST
 
@@ -176,3 +176,263 @@ fabric_sync → drains the outbox → uploads to ADLS Gen2 / OneLake (retry + ba
 - **Runs where `otel.db` lives** (the receiver host); SQLite is single-host.
 
 No third-party Python dependencies — standard library only.
+
+---
+
+## Next steps
+
+Rollout plan from the current single-machine setup to company-wide capture.
+
+### The constraint that shapes everything
+
+**SQLite is single-host and single-connection.** `otel_store.py` opens one
+`sqlite3.connect(path)` (no WAL, no `check_same_thread=False`) and `receiver.py`
+uses `HTTPServer`, not `ThreadingHTTPServer`. Therefore:
+
+- Exactly **one** receiver process, on **one** host, with a **persistent disk**.
+  No horizontal scaling, no autoscale, no serverless.
+- Requests are handled **serially** — one slow or oversized POST blocks every
+  other machine's export.
+- The sync job must run **on that same host** (it reads the same `otel.db`).
+
+Everything below either works inside that constraint or states when to break it.
+
+### Where the receiver gets hosted
+
+**A single Azure Linux VM** (B2s / D2s v5 + a managed data disk) in the same
+region as `sacyclotroninsights`, running `docker-compose.yml` with the disk
+mounted at `./otel-data`. Roughly $40–80/mo.
+
+| Option | Verdict |
+|---|---|
+| **Azure VM** | ✅ Matches single-host SQLite. Full control of TLS, timers, backups. |
+| Container Apps / App Service | ❌ SQLite needs a real filesystem; Azure Files means SQLite locking over SMB (corruption risk). Scale-to-zero drops telemetry. |
+| AKS | ❌ Orchestrating a deliberately single-replica stateful pod. |
+
+Sizing is generous at 2 vCPU — per request the work is a JSON parse plus a few
+`INSERT OR IGNORE`s. **Disk growth is the thing to watch, not CPU.**
+
+**Network reachability is the harder question.** `managed-settings.json` points at
+an internal hostname, but dev laptops roam. Claude Code's OTLP exporter keeps an
+**in-memory** queue: if the endpoint is unreachable it retries briefly, then
+**drops the datapoints on process exit**. There is no on-disk spool, so off-VPN
+sessions are permanently unbilled. Two viable postures:
+
+- **A — internal-only + always-on VPN.** No code changes; accept the coverage
+  loss and measure it with `reconcile.py`.
+- **B — public HTTPS + shared bearer token** (recommended if devs work off-VPN).
+  Ship the token via `OTEL_EXPORTER_OTLP_HEADERS` in managed settings and
+  validate it in the receiver. Requires the auth work in *Harden* below.
+
+> The receiver currently has **no authentication**. Any host that can reach
+> `:4318` can POST arbitrary token/cost datapoints into billing truth — inflating
+> or deflating a client invoice is an unauthenticated HTTP call. Fine on
+> localhost; a hard blocker for posture B.
+
+### Does this consume developer machine capacity?
+
+**No, negligibly.**
+
+- **Network** — one POST per `OTEL_METRIC_EXPORT_INTERVAL` (60s) per active
+  session, gzipped JSON of a few KB. Delta temporality means idle minutes emit
+  nothing.
+- **CPU** — the OTEL SDK batches on a background thread, inside a process already
+  waiting on model responses. Unmeasurable against Claude Code's own footprint.
+- **`claude-wrapper.sh`** — one `git config --get remote.origin.url` plus an
+  `exec`, once per session launch. Not in the per-turn path.
+- **Laptop disk** — zero; nothing is spooled locally.
+
+The real developer-facing cost is behavioral, not performance: sessions must
+start **inside a git repo with an `origin` remote** (else `repo=unknown`, which is
+unattributable), and the **VS Code extension does not export OTEL**, so the CLI is
+the only billable surface. Both are coverage problems wearing UX clothing.
+Re-confirm the VS Code limitation against the current Claude Code version before
+building policy on it.
+
+### Phase 0 — Decisions and clearances (before any infra)
+
+1. **Fleet size + peak concurrent sessions.** The branch point for *Harden*:
+   SQLite is fine to a few hundred devs; beyond that, Collector + Postgres.
+2. **Network posture** — A or B above.
+3. **Employee notice.** The pipeline stores `user_email` per repo per day, and
+   managed settings deliberately prevent opting out. That is per-developer
+   monitoring; involve HR/legal for notice or works-council consultation as the
+   jurisdiction requires. Cheap now, expensive after rollout.
+4. **Ownership / on-call.** Receiver downtime is *silently lost revenue*, not a
+   visible outage — nobody files a ticket.
+5. **Client-mapping owner** — the `repoclientmap` sheet (section 4) is now a
+   billing input. Who owns adding a repo when a project starts, and who is
+   accountable when one is missing? See Phase 6.1.
+
+### Phase 1 — Stand up the server (1–2 days)
+
+1. Provision the VM; attach and mount a managed disk for `otel-data`.
+2. Clone to `/opt/cyclotron/internal-billing-engine` (the path
+   `scheduler --emit-cron` already prints).
+3. Fill `.env` from `.env.example`: `SYNC_TARGET=adls`, `SYNC_AUTH=sp`, the
+   `ADLS_*` values, and the `AZURE_*` service principal. Grant that SP
+   **Storage Blob Data Contributor** on the container.
+4. Enable TLS — uncomment the Caddy sidecar in `docker-compose.yml` and point DNS
+   at the VM. Dev machines hit `https://`, never raw `:4318`.
+5. `docker compose up -d --build`; verify with `billing.otel.sample_payload`
+   against the real endpoint and a `--dry-run` sync.
+6. **Prove the full chain with synthetic data before enrolling a single laptop** —
+   receiver → `otel.db` → export → ADLS → Fabric table. Debugging this with live
+   fleet traffic is miserable.
+
+### Phase 2 — Pilot (1–2 weeks, 5–10 volunteers)
+
+The pilot exists to produce numbers that cannot be estimated:
+
+- **Coverage** — `python -m billing.reconcile --start … --end …`. The funnel
+  (truth → captured → repo-tagged) is the acceptance test. truth→captured is
+  telemetry loss (roaming, restarts, VS Code); captured→tagged is the `unknown`
+  bucket (sessions outside a git repo).
+- **Rows per developer per day** — count `token_usage` rows ÷ active devs. This is
+  the input to the capacity plan below.
+- **The `unknown` rate** — flagged by `bill.py`. High means a workflow problem to
+  fix with policy, not code.
+
+**Do not start the fleet rollout until coverage is a number worth defending to a
+client.** Invoices will be built on it.
+
+### Phase 3 — Harden (during the pilot, in this order)
+
+1. **Receiver authentication.** Validate a bearer token in `do_POST` before
+   ingesting. Blocking for a public endpoint; ~10 lines regardless.
+2. **Concurrency.** Serial handling queues under fleet load. Moving to
+   `ThreadingHTTPServer` *also* requires fixing the store — `check_same_thread=False`
+   plus a write lock (or a connection per thread) — and `PRAGMA journal_mode=WAL`
+   so the sync job's long reads don't block ingest. **Do not do one without the
+   other**; threading the server against today's single-connection store throws
+   at runtime.
+3. **Log rotation.** `receiver.py:_log()` appends every request to `receiver.log`
+   forever with no rotation. On a fleet that fills the disk, and a full disk stops
+   ingest.
+4. **Backups.** `otel.db` is the sole source of billing truth. Nightly
+   `sqlite3 .backup` (**not** a file copy of a live DB) to blob storage, with a
+   **tested restore**.
+5. **Monitoring.** Alert on: receiver down; zero datapoints in N business hours;
+   `fabric_outbox` rows in `failed`; disk >80%. `run-sync.sh` already exits
+   non-zero on delivery failure — wire it to alerting.
+6. **Capacity checkpoint.** `export.py` rebuilds all history each sync with a full
+   `GROUP BY` scan. Correct, simple, and fine for year one; it degrades as raw
+   datapoints accumulate. Multiply the pilot's rows/dev/day by fleet size to find
+   the date, and plan a compaction step (roll datapoints older than ~90 days into
+   daily aggregates, prune) before the DB reaches a few GB.
+
+If Phase 0 says the fleet is large (~500+ devs), skip the SQLite hardening: put an
+**OpenTelemetry Collector** in front for buffering/retry and migrate the store to
+Postgres.
+
+### Phase 4 — Fleet rollout (waves, 2–4 weeks)
+
+Push via MDM in waves (10% → 50% → 100%), watching receiver load and the
+`unknown` rate at each step:
+
+1. `managed-settings.json` to the system path for each OS.
+2. Real binary at `/opt/cyclotron/claude-real`, `claude-wrapper.sh` as the only
+   `claude` on PATH, and **`CLAUDE_REAL_BIN` pinned** — auto-discovery exists, but
+   across Homebrew/npm/nvm installs PATH-order guessing is how you get a wrapper
+   that execs itself or a stale binary.
+3. **Both artifacts together.** Settings without the wrapper is the worst
+   outcome: it looks like success while being entirely unbillable.
+4. Verify per wave using `deploy/README.md`, and confirm the managed-settings path
+   against the installed Claude Code version rather than trusting the table.
+
+### Phase 5 — Schedule the sync
+
+**Use a systemd timer — not the `--loop` service, and not plain cron.**
+
+The `sync` compose service calls `time.sleep(86_400)`; with
+`restart: unless-stopped`, every reboot resets the phase, so "daily 23:30" drifts
+to whenever the box last came up. A systemd timer with `Persistent=true` also
+catches runs missed while the VM was down, and gives `journalctl` history and
+exit-code handling for free.
+
+```
+# scheduler --emit-cron prints the equivalent line
+30 23 * * *  cd /opt/cyclotron/internal-billing-engine && ./deploy/run-sync.sh
+```
+
+**Drop the `sync` service from `docker compose up`** so two schedulers aren't
+racing on the same DB.
+
+**Then sequence Fabric carefully.** `fabric_client.upload_file` is
+create-truncate → append → flush, so between truncate and flush the blob is empty
+or partial. `refresh_billing_tables.py` overwrites the Delta tables from those
+CSVs — firing inside that window overwrites a good table with a truncated one.
+Cheapest fix first:
+
+- Schedule the notebook with a wide margin (sync 23:30 UTC → notebook 00:30 UTC)
+  **and** have it sanity-check row count + `generated_at` before overwriting.
+- Better: upload to `<name>.tmp` and copy to the final path on success, so readers
+  only ever see complete files.
+
+Start at `SYNC_FREQUENCY=daily`. `hourly` re-uploads the entire history every hour
+and widens the truncate window twenty-four-fold.
+
+### Phase 6 — Harden the client-invoice layer
+
+Client mapping and aggregation now live in Fabric (section 4): the notebook joins
+`claudeusagelineitems` to `repoclientmap` and groups by client/repo/model. That
+closes the "can we invoice at all" gap. What's left is making it *trustworthy*
+enough to bill on — note the billing identity now spans two systems, so the Python
+engine and the Fabric notebook can disagree.
+
+1. **Decide what happens to an unmapped repo.** The single highest-risk item. If
+   the notebook **inner**-joins `repoclientmap`, every repo missing from the sheet
+   is silently dropped — real usage, invisibly unbilled, with no error anywhere.
+   Left-join instead and surface unmapped repos as an explicit exception row that
+   someone has to clear before the invoice is issued. **Never default an unmapped
+   repo to a client.**
+2. **Fix the refresh ordering.** The dataflow refreshes `repoclientmap` daily at
+   **23:59 PST**, but the sync ships CSVs at **23:30 UTC** (= 16:30 PST) and the
+   Delta-table notebook runs shortly after. So the invoice notebook can join
+   against a map that is up to a day stale — a repo mapped today won't bill
+   correctly until tomorrow. Either move the dataflow ahead of the notebook or
+   have the notebook trigger/verify the refresh before joining. Also note this is
+   the one **PST** schedule in an otherwise all-UTC pipeline; DST shifts it twice
+   a year relative to everything else.
+3. **Make the mapping auditable.** A SharePoint workbook has no meaningful version
+   history for billing purposes — you cannot reconstruct which mapping produced
+   last quarter's invoice, which is exactly what a client dispute asks for.
+   Snapshot the resolved map alongside each invoice, or move it to a Fabric table
+   with effective-dated rows (`valid_from` / `valid_to`) so re-running a closed
+   month reproduces the original numbers. Also add validation on ingest: one
+   client per repo, no blank clients, no duplicate repo keys.
+4. **Reconcile Fabric totals against `otel.db`.** Two aggregation paths now exist
+   (`invoice.py` locally, the notebook in Fabric). Assert per-month totals match;
+   a silent divergence means one of them is wrong and you won't know which.
+5. **Real rates.** `rating.py` rates are placeholders. Billing runs off actual
+   reported cost so this mainly affects the cross-check — but a cross-check
+   against fictional numbers isn't one.
+6. **Confirm the markup.** `1.5` is hardcoded as the default in `scheduler.py` and
+   `run-sync.sh`, and is applied *before* Fabric sees the data. If markup varies by
+   contract it belongs next to the client mapping, not in a CLI default — and it
+   must be applied in exactly one place.
+7. **Fix the invoice period label** — `invoice.py` prints
+   `Period: 2026-07-01 → 2026-08-01`, but `period_end` is *exclusive*. A client
+   will read it as inclusive and ask why they're billed for August 1. Display
+   `→ 2026-07-31` (or `July 2026`) while keeping the exclusive bound in the query.
+   The section-4 notebook filters on the same columns, so apply the same
+   convention there. Same clarification belongs in `fabric/README.md`, where the
+   column is described without noting the bound is exclusive.
+8. **A sign-off step.** Invoices persist as `status='draft'`. Someone must review
+   and flip to `issued` before money is requested. Never auto-send.
+
+### Phase 7 — Steady state
+
+Monthly close (`scheduler --month YYYY-MM` backfills a closed month once late
+telemetry settles), reconcile-based coverage as an ongoing KPI, onboarding for new
+repos and new hires, and a quarterly review of the `unknown` bucket.
+
+### Open decisions
+
+Two answers change the plan materially:
+
+- **Fleet size + peak concurrent sessions** — decides SQLite-plus-hardening vs.
+  Collector-plus-Postgres, a very different Phase 3.
+- **Do developers work off-VPN?** — decides whether receiver auth is a
+  nice-to-have or a Phase 1 blocker, and how much coverage loss the pilot should
+  be expected to reveal.
