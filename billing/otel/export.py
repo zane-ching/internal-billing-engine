@@ -26,6 +26,7 @@ import csv
 import os
 from datetime import date, datetime, timezone
 
+from .attribute import resolved_view
 from .normalize import normalize_model, repo_name
 from .otel_store import OtelStore
 
@@ -69,22 +70,27 @@ def build(store: OtelStore, markup: float):
             cur[0] = min(cur[0], lo)
             cur[1] = max(cur[1], hi)
 
+    # Repo is resolved per datapoint BEFORE the day/model/user rollup, so a
+    # session that moved between repos splits into separate rows rather than
+    # billing wholly to wherever it launched. See billing.otel.attribute.
     cost = {}
     for r in store.db.execute(
-            "SELECT substr(ts,1,10) d, repo, model, user_email, SUM(cost_usd) c, "
-            "MIN(ts) lo, MAX(ts) hi "
-            "FROM cost_usage GROUP BY d, repo, model, user_email"):
-        key = (r["d"], r["repo"], normalize_model(r["model"]),
+            f"WITH r AS ({resolved_view('cost_usage')}) "
+            "SELECT substr(ts,1,10) d, resolved_repo, model, user_email, "
+            "SUM(cost_usd) c, MIN(ts) lo, MAX(ts) hi "
+            "FROM r GROUP BY d, resolved_repo, model, user_email"):
+        key = (r["d"], r["resolved_repo"], normalize_model(r["model"]),
                r["user_email"] or UNKNOWN_USER)
         cost[key] = r["c"] or 0.0
         _span(key, r["lo"], r["hi"])
 
     toks = {}
     for r in store.db.execute(
-            "SELECT substr(ts,1,10) d, repo, model, user_email, SUM(tokens) t, "
-            "MIN(ts) lo, MAX(ts) hi "
-            "FROM token_usage GROUP BY d, repo, model, user_email"):
-        key = (r["d"], r["repo"], normalize_model(r["model"]),
+            f"WITH r AS ({resolved_view('token_usage')}) "
+            "SELECT substr(ts,1,10) d, resolved_repo, model, user_email, "
+            "SUM(tokens) t, MIN(ts) lo, MAX(ts) hi "
+            "FROM r GROUP BY d, resolved_repo, model, user_email"):
+        key = (r["d"], r["resolved_repo"], normalize_model(r["model"]),
                r["user_email"] or UNKNOWN_USER)
         toks[key] = r["t"] or 0
         _span(key, r["lo"], r["hi"])
@@ -147,3 +153,41 @@ def build_and_enqueue(store: OtelStore, markup: float, out_dir: str = "exports")
     store.fabric_enqueue(kind=LINEITEMS_TABLE, period_start="running", period_end="running",
                          local_path=os.path.abspath(lp), onelake_path=f"{LINEITEMS_TABLE}.csv")
     return len(summary_rows), len(line_rows)
+
+
+def main():
+    """Write the running CSVs locally, without needing a storage target.
+
+    The scheduler only calls build_and_enqueue() when ADLS/OneLake credentials
+    are configured, so this is the way to regenerate and inspect the lake tables
+    on a machine with no storage target — demos, local verification, debugging a
+    row that looks wrong before it ships.
+    """
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--db", default=None, help="OTEL store path (default ./data/otel.db)")
+    ap.add_argument("--markup", type=float, default=1.50)
+    ap.add_argument("--out-dir", default="exports")
+    ap.add_argument("--no-enqueue", action="store_true",
+                    help="write the CSVs but do not queue them for upload")
+    args = ap.parse_args()
+
+    store = OtelStore(args.db) if args.db else OtelStore()
+    if args.no_enqueue:
+        summary_rows, line_rows = build(store, args.markup)
+        os.makedirs(args.out_dir, exist_ok=True)
+        _write_csv(os.path.join(args.out_dir, f"{SUMMARY_TABLE}.csv"),
+                   SUMMARY_FIELDS, summary_rows)
+        _write_csv(os.path.join(args.out_dir, f"{LINEITEMS_TABLE}.csv"),
+                   LINE_FIELDS, line_rows)
+        ns, nl = len(summary_rows), len(line_rows)
+    else:
+        ns, nl = build_and_enqueue(store, args.markup, args.out_dir)
+    store.commit()
+    store.close()
+    print(f"[export] {args.out_dir}/{SUMMARY_TABLE}.csv    {ns} row(s)")
+    print(f"[export] {args.out_dir}/{LINEITEMS_TABLE}.csv  {nl} row(s)")
+
+
+if __name__ == "__main__":
+    main()

@@ -50,6 +50,24 @@ CREATE TABLE IF NOT EXISTS cost_usage (
 );
 CREATE INDEX IF NOT EXISTS ix_cost_repo ON cost_usage(repo);
 
+CREATE TABLE IF NOT EXISTS session_repo_timeline (
+  session_id TEXT,                  -- joins to token_usage.session_id / cost_usage.session_id
+  ts TEXT,                          -- UTC second when this repo became active
+                                    -- (SAME format as token_usage.ts so the
+                                    --  as-of join can compare lexicographically)
+  seq INTEGER,                      -- ms-within-second, orders events inside one second
+  repo TEXT,                        -- normalized repo key ('unknown' if no remote)
+  repo_raw TEXT,                    -- original git remote URL
+  cwd TEXT,                         -- working directory that produced it
+  event TEXT,                       -- SessionStart | CwdChanged | DirectoryAdded | SessionEnd
+  ingested_at TEXT,
+  PRIMARY KEY (session_id, ts, seq, repo)   -- a byte-identical replay of one
+                                            -- POST is a no-op; separate hook
+                                            -- firings carry distinct seq and
+                                            -- are kept as separate entries
+);
+CREATE INDEX IF NOT EXISTS ix_timeline_session ON session_repo_timeline(session_id, ts);
+
 CREATE TABLE IF NOT EXISTS repo_name_map (
   repo TEXT PRIMARY KEY,            -- normalized repo key
   bill_name TEXT,                   -- OPTIONAL override billing name
@@ -158,6 +176,47 @@ class OtelStore:
              user_email, user_id, org_id, model, query_source,
              float(cost_usd or 0), _now()))
         return cur.rowcount > 0
+
+    # ---- session -> repo timeline (fed by the CwdChanged hook) ---------
+    def insert_session_repo(self, *, session_id, ts, seq, repo, repo_raw, cwd,
+                            event) -> bool:
+        """Record that `session_id` was working in `repo` as of `ts`.
+
+        Returns True if inserted, False if an identical entry already existed.
+        Duplicate entries for the same repo+second are harmless — the as-of
+        join reads the latest one and they all name the same repo.
+        """
+        cur = self.db.execute(
+            """INSERT OR IGNORE INTO session_repo_timeline
+               (session_id, ts, seq, repo, repo_raw, cwd, event, ingested_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (session_id, ts, int(seq or 0), repo, repo_raw or "", cwd or "",
+             event or "", _now()))
+        return cur.rowcount > 0
+
+    def multi_repo_sessions(self) -> dict:
+        """session_id -> sorted list of repos, for sessions whose timeline shows
+        more than one repo. These are the sessions whose usage gets split across
+        repos, so they're the ones worth eyeballing before invoicing."""
+        rows = self.db.execute(
+            """SELECT session_id, repo FROM session_repo_timeline
+               WHERE session_id IN (
+                   SELECT session_id FROM session_repo_timeline
+                   GROUP BY session_id HAVING COUNT(DISTINCT repo) > 1)
+               GROUP BY session_id, repo ORDER BY session_id, repo""").fetchall()
+        out: dict = {}
+        for r in rows:
+            out.setdefault(r["session_id"], []).append(r["repo"])
+        return out
+
+    def timeline_counts(self) -> dict:
+        row = self.db.execute(
+            """SELECT COUNT(*) entries,
+                      COUNT(DISTINCT session_id) sessions,
+                      COUNT(DISTINCT repo) repos
+               FROM session_repo_timeline""").fetchone()
+        return {"entries": row["entries"], "sessions": row["sessions"],
+                "repos": row["repos"]}
 
     # ---- repo -> billing-name override map (optional) ------------------
     def distinct_repos(self):

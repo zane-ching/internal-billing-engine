@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 
+from .attribute import resolved_view
 from .normalize import normalize_model, repo_name
 from .otel_store import OtelStore
 from .rating import RatingService
@@ -48,16 +49,28 @@ def run(db: str | None = None, markup: float = 1.50, basis: str = "actual"):
     mapping = store.get_mapping()
     name_of = lambda repo: mapping.get(repo) or repo_name(repo)
 
-    # Actual cost (Anthropic's own figure) per repo x model.
+    # Repo is RESOLVED per datapoint against the session->repo timeline, so a
+    # session that moved between repos splits across them instead of billing
+    # entirely to wherever it launched. Falls back to the wrapper's launch-time
+    # tag when no timeline exists. See billing.otel.attribute.
     actual_rows = store.db.execute(
-        "SELECT repo, model, SUM(cost_usd) c FROM cost_usage "
-        "GROUP BY repo, model").fetchall()
+        f"WITH r AS ({resolved_view('cost_usage')}) "
+        "SELECT resolved_repo AS repo, model, SUM(cost_usd) c FROM r "
+        "GROUP BY resolved_repo, model").fetchall()
     have_cost = bool(actual_rows)
 
     # Rate-card estimate per repo x model (from token counts).
     token_rows = store.db.execute(
-        "SELECT repo, model, token_type, SUM(tokens) tok FROM token_usage "
-        "GROUP BY repo, model, token_type").fetchall()
+        f"WITH r AS ({resolved_view('token_usage')}) "
+        "SELECT resolved_repo AS repo, model, token_type, SUM(tokens) tok FROM r "
+        "GROUP BY resolved_repo, model, token_type").fetchall()
+
+    # How much of the bill each signal is carrying, and which sessions moved.
+    source_rows = store.db.execute(
+        f"WITH r AS ({resolved_view('token_usage')}) "
+        "SELECT attribution_source, SUM(tokens) tok FROM r "
+        "GROUP BY attribution_source ORDER BY tok DESC").fetchall()
+    multi_repo = store.multi_repo_sessions()
 
     if basis == "actual" and not have_cost:
         basis = "rates"
@@ -127,10 +140,35 @@ def run(db: str | None = None, markup: float = 1.50, basis: str = "actual"):
         print(f"\ncross-check  actual=${ac:,.4f}  rate-card=${rc:,.4f}"
               + (f"  (rate-card is {rc/ac:.2f}x actual)" if ac else ""))
 
+    # Attribution provenance — which signal produced each repo label.
+    SOURCE_NOTE = {
+        "timeline": "hook timeline (mid-session switches attributed)",
+        "wrapper":  "wrapper launch tag only (no timeline for that session)",
+        "no_remote": "wrapper ran outside a git repo -> unbillable",
+        "absent":   "no repo attribute at all -> session bypassed the wrapper",
+    }
+    if source_rows:
+        total_tok = sum(r["tok"] or 0 for r in source_rows) or 1
+        print("\nATTRIBUTION SOURCE")
+        rule()
+        for r in source_rows:
+            src, tok = r["attribution_source"], r["tok"] or 0
+            print(f"  {src:<11} {ftok(tok):>8}  {tok/total_tok*100:>5.1f}%"
+                  f"  {SOURCE_NOTE.get(src, '')}")
+
+    if multi_repo:
+        print(f"\n⚠  MULTI-REPO SESSIONS ({len(multi_repo)}) — usage split across repos:")
+        for sid, repos in sorted(multi_repo.items()):
+            print(f"     {sid[:8]}  {' + '.join(repos)}")
+        print("   Split by the timeline's as-of join. Review before invoicing —")
+        print("   a switch inside one 60s export interval lands wholly on one side.")
+
     if unattributed:
-        print("\n⚠  UNATTRIBUTED usage (sessions with no git remote -> no repo):")
-        print("     billed under the 'unknown' bucket; not tied to any repo.")
-        print("   Fix: ensure sessions run inside a git repo so a remote is tagged.")
+        print("\n⚠  UNATTRIBUTED usage -> 'unknown' bucket, not tied to any repo.")
+        print("   'no_remote' = ran outside a git repo (genuinely unbillable).")
+        print("   'absent'    = no repo tag arrived; the session never passed")
+        print("                 through the wrapper (non-CLI surface, or a bad")
+        print("                 install). That usage IS billable but unattributed.")
 
     store.close()
 

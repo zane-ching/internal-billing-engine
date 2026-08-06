@@ -335,6 +335,11 @@ Push via MDM in waves (10% → 50% → 100%), watching receiver load and the
    `claude` on PATH, and **`CLAUDE_REAL_BIN` pinned** — auto-discovery exists, but
    across Homebrew/npm/nvm installs PATH-order guessing is how you get a wrapper
    that execs itself or a stale binary.
+   Pin it **in the shell environment** (system profile or MDM environment
+   payload), *not* in `managed-settings.json` — Claude Code applies that file's
+   `env` to itself, and the wrapper is its parent process, so it never sees it.
+   Ship **one copy** of the wrapper per machine (symlinks are fine); two copies
+   used to exec each other and hang the session. See `deploy/README.md`.
 3. **Both artifacts together.** Settings without the wrapper is the worst
    outcome: it looks like success while being entirely unbillable.
 4. Verify per wave using `deploy/README.md`, and confirm the managed-settings path

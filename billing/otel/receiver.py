@@ -5,6 +5,11 @@ Accepts OTLP/HTTP JSON on /v1/metrics (and acks /v1/logs, /v1/traces), extracts
 `repo` resource attribute) + user + model + token type, and writes deduped rows
 to the OTEL store.
 
+Also accepts POST /v1/session-repo — NOT an OTLP endpoint. That's the
+session->repo timeline fed by the CwdChanged hook (deploy/claude-repo-tag.py),
+which is how mid-session repo switches get attributed; the frozen `repo=`
+resource attribute can't see them. See billing.otel.attribute.
+
 Point Claude Code at it with:
     OTEL_EXPORTER_OTLP_PROTOCOL=http/json
     OTEL_EXPORTER_OTLP_ENDPOINT=http://<host>:4318
@@ -157,6 +162,25 @@ def ingest_metrics_payload(payload: dict, store: OtelStore) -> dict:
             "metrics_seen": sorted(n for n in names if n)}
 
 
+def ingest_session_repo_payload(payload: dict, store: OtelStore) -> dict:
+    """Record one session->repo timeline entry, as POSTed by the CwdChanged hook
+    (deploy/claude-repo-tag.py). See billing.otel.attribute for how it's joined
+    back onto the usage datapoints at billing time."""
+    session_id = (payload.get("session_id") or "").strip()
+    ts = (payload.get("ts") or "").strip()
+    if not session_id or not ts:
+        raise ValueError("session_id and ts are required")
+    repo_raw = payload.get("repo_raw") or ""
+    inserted = store.insert_session_repo(
+        session_id=session_id, ts=ts, seq=payload.get("seq") or 0,
+        repo=normalize_remote(repo_raw), repo_raw=repo_raw,
+        cwd=payload.get("cwd") or "", event=payload.get("event") or "")
+    store.commit()
+    return {"inserted": 1 if inserted else 0,
+            "duplicate": 0 if inserted else 1,
+            "repo": normalize_remote(repo_raw)}
+
+
 class Handler(BaseHTTPRequestHandler):
     store: OtelStore = None  # set by serve()
 
@@ -191,6 +215,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.end_headers()
                 return
+        elif path.endswith("/v1/session-repo"):
+            try:
+                result = ingest_session_repo_payload(json.loads(raw or b"{}"), self.store)
+                msg = (f"/v1/session-repo repo={result['repo']} "
+                       f"new={result['inserted']} dup={result['duplicate']}")
+                print(f"[receiver] {msg}")
+                _log(msg)
+            except (ValueError, KeyError) as e:
+                print(f"[receiver] bad session-repo payload: {e}")
+                _log(f"BAD session-repo payload: {e}  first120={raw[:120]!r}")
+                self.send_response(400)
+                self.end_headers()
+                return
         # /v1/logs, /v1/traces, anything else: just acknowledge
         self._ok()
 
@@ -198,7 +235,8 @@ class Handler(BaseHTTPRequestHandler):
 def serve(host: str, port: int, db: str | None = None):
     Handler.store = OtelStore(db) if db else OtelStore()
     server = HTTPServer((host, port), Handler)
-    print(f"[receiver] listening on http://{host}:{port}  (POST /v1/metrics)")
+    print(f"[receiver] listening on http://{host}:{port}  "
+          f"(POST /v1/metrics, /v1/session-repo)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

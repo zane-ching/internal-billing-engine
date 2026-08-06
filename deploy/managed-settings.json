@@ -6,6 +6,21 @@
     "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
     "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otel-billing.internal.cyclotron.com:4318",
     "OTEL_METRIC_EXPORT_INTERVAL": "60000",
-    "OTEL_METRICS_INCLUDE_SESSION_ID": "true"
+    "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
+    "CLAUDE_BILLING_RECEIVER": "https://otel-billing.internal.cyclotron.com:4318"
+  },
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "/opt/cyclotron/claude-repo-tag.py" }] }
+    ],
+    "CwdChanged": [
+      { "hooks": [{ "type": "command", "command": "/opt/cyclotron/claude-repo-tag.py" }] }
+    ],
+    "DirectoryAdded": [
+      { "hooks": [{ "type": "command", "command": "/opt/cyclotron/claude-repo-tag.py" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "/opt/cyclotron/claude-repo-tag.py" }] }
+    ]
   }
 }
