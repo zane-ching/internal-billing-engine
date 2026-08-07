@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """Claude Code hook: record which repo a session is working in, over time.
 
-Registered on SessionStart / CwdChanged / DirectoryAdded / SessionEnd (see
-managed-settings.json). Claude Code passes a JSON object on stdin carrying
-`session_id`, `cwd`, and `hook_event_name`; this resolves `cwd` to a git remote
-and POSTs one timeline entry to the billing receiver.
+Registered on SessionStart / CwdChanged / DirectoryAdded / SessionEnd /
+UserPromptSubmit (see managed-settings.json). Claude Code passes a JSON object
+on stdin carrying `session_id`, `cwd`, and `hook_event_name`; this resolves
+`cwd` to a git remote and POSTs one timeline entry to the billing receiver.
 
 Why a hook and not the wrapper: OTEL resource attributes (where the wrapper puts
 `repo=`) are frozen at process start, so the wrapper cannot see a mid-session
 `cd`. Hooks fire on the transition and run on every Claude Code surface (CLI,
 IDE extension, desktop, web), not just the CLI the wrapper shims.
+
+Why UserPromptSubmit on top of the transition events: on non-CLI surfaces the
+wrapper never runs, so this hook is the ONLY repo signal. A session whose very
+first delivery is missed (receiver down, or the process started before the hook
+was registered) has no timeline row at all, both rungs of the as-of join return
+NULL, and the WHOLE session silently bills to 'unknown'. Re-tagging on every
+prompt makes any single miss self-healing. It's registered `async` so a slow or
+unreachable receiver never adds latency to a prompt, and the receiver dedupes
+byte-identical replays on its primary key.
 
     Receiver URL:  CLAUDE_BILLING_RECEIVER  (default http://127.0.0.1:4318)
 

@@ -21,6 +21,9 @@
     ],
     "SessionEnd": [
       { "hooks": [{ "type": "command", "command": "/opt/cyclotron/claude-repo-tag.py" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "/opt/cyclotron/claude-repo-tag.py", "async": true }] }
     ]
   }
 }
