@@ -14,6 +14,18 @@ Point Claude Code at it with:
     OTEL_EXPORTER_OTLP_PROTOCOL=http/json
     OTEL_EXPORTER_OTLP_ENDPOINT=http://<host>:4318
 
+Authentication (shared fleet token):
+    Set RECEIVER_AUTH_TOKEN and every write (POST) must present it, either as
+        X-Billing-Token: <token>          (preferred — no spaces to encode)
+        Authorization: Bearer <token>
+    Clients: Claude Code sends it via OTEL_EXPORTER_OTLP_HEADERS, the CwdChanged
+    hook via CLAUDE_BILLING_TOKEN (see deploy/). The token authenticates a fleet
+    machine, not an individual user — it stops unauthorized injection from
+    anything that can merely reach the port, not forgery by a holder of the
+    token. If RECEIVER_AUTH_TOKEN is unset the receiver stays open (with a loud
+    warning) so the token can be rolled out to machines before enforcement is
+    turned on; pass --require-auth to refuse to start without one.
+
 Dependency-free (stdlib http.server). For production durability you'd normally
 front this with an OpenTelemetry Collector; this is the lean direct path.
 """
@@ -22,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hmac
 import json
 import os
 import time
@@ -36,6 +49,19 @@ load_env()
 TOKEN_METRIC = "claude_code.token.usage"
 COST_METRIC = "claude_code.cost.usage"
 LOG_PATH = os.environ.get("RECEIVER_LOG", "data/receiver.log")
+AUTH_TOKEN = os.environ.get("RECEIVER_AUTH_TOKEN", "").strip()
+
+
+def _presented_token(headers) -> str:
+    """The credential a request presents, from X-Billing-Token or a Bearer
+    Authorization header ('' if neither is present)."""
+    tok = headers.get("X-Billing-Token")
+    if tok:
+        return tok.strip()
+    auth = headers.get("Authorization", "")
+    if auth[:7].lower() == "bearer ":
+        return auth[7:].strip()
+    return ""
 
 
 def _log(msg: str) -> None:
@@ -194,7 +220,30 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorized(self) -> bool:
+        """True if auth is disabled, or the request presents the right token.
+        Compared in constant time so a wrong token leaks nothing via timing."""
+        if not AUTH_TOKEN:
+            return True
+        presented = _presented_token(self.headers)
+        return bool(presented) and hmac.compare_digest(presented, AUTH_TOKEN)
+
+    def _unauthorized(self):
+        body = b'{"error":"unauthorized"}'
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("WWW-Authenticate", "Bearer")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
+        # Reject before reading/parsing the body: an unauthenticated caller
+        # never reaches the store, and we don't spend work on junk traffic.
+        if not self._authorized():
+            _log(f"401 POST {self.path} (missing/invalid token)")
+            self._unauthorized()
+            return
         raw = _read_body(self)
         path = self.path.rstrip("/")
         ctype = self.headers.get("Content-Type", "?")
@@ -232,11 +281,19 @@ class Handler(BaseHTTPRequestHandler):
         self._ok()
 
 
-def serve(host: str, port: int, db: str | None = None):
+def serve(host: str, port: int, db: str | None = None, require_auth: bool = False):
+    if require_auth and not AUTH_TOKEN:
+        raise SystemExit(
+            "[receiver] --require-auth set but RECEIVER_AUTH_TOKEN is empty — refusing "
+            "to start. Set the token, or drop --require-auth to run open.")
     Handler.store = OtelStore(db) if db else OtelStore()
     server = HTTPServer((host, port), Handler)
-    print(f"[receiver] listening on http://{host}:{port}  "
+    auth_state = "ENABLED" if AUTH_TOKEN else "DISABLED"
+    print(f"[receiver] listening on http://{host}:{port}  auth={auth_state}  "
           f"(POST /v1/metrics, /v1/session-repo)")
+    if not AUTH_TOKEN:
+        print("[receiver] WARNING: RECEIVER_AUTH_TOKEN is unset — any client that can "
+              "reach this port can write billing rows. Set it to require a token.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -250,8 +307,10 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=4318)
     ap.add_argument("--db", default=None)
+    ap.add_argument("--require-auth", action="store_true",
+                    help="refuse to start unless RECEIVER_AUTH_TOKEN is set")
     args = ap.parse_args()
-    serve(args.host, args.port, args.db)
+    serve(args.host, args.port, args.db, require_auth=args.require_auth)
 
 
 if __name__ == "__main__":

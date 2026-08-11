@@ -42,6 +42,10 @@ from datetime import datetime, timezone
 RECEIVER = os.environ.get("CLAUDE_BILLING_RECEIVER", "http://127.0.0.1:4318")
 ENDPOINT = "/v1/session-repo"
 TIMEOUT = float(os.environ.get("CLAUDE_BILLING_TIMEOUT", "2.0"))
+# Shared fleet token; sent so the receiver accepts this write. Empty = the
+# receiver is running open (see billing/otel/receiver.py). Never block a
+# session over auth: a rejected post is dropped like any other failed one.
+TOKEN = os.environ.get("CLAUDE_BILLING_TOKEN", "").strip()
 
 
 def git_remote(cwd: str) -> str:
@@ -83,9 +87,12 @@ def main() -> int:
         "agent_id": payload.get("agent_id") or "",
     }).encode()
 
+    headers = {"Content-Type": "application/json"}
+    if TOKEN:
+        headers["X-Billing-Token"] = TOKEN
     req = urllib.request.Request(
         RECEIVER.rstrip("/") + ENDPOINT, data=body,
-        headers={"Content-Type": "application/json"}, method="POST")
+        headers=headers, method="POST")
     try:
         urllib.request.urlopen(req, timeout=TIMEOUT).read()
     except (urllib.error.URLError, OSError, ValueError):

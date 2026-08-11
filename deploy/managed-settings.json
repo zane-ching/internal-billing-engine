@@ -7,7 +7,9 @@
     "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otel-billing.internal.cyclotron.com:4318",
     "OTEL_METRIC_EXPORT_INTERVAL": "60000",
     "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
-    "CLAUDE_BILLING_RECEIVER": "https://otel-billing.internal.cyclotron.com:4318"
+    "OTEL_EXPORTER_OTLP_HEADERS": "X-Billing-Token=REPLACE_WITH_FLEET_BILLING_TOKEN",
+    "CLAUDE_BILLING_RECEIVER": "https://otel-billing.internal.cyclotron.com:4318",
+    "CLAUDE_BILLING_TOKEN": "REPLACE_WITH_FLEET_BILLING_TOKEN"
   },
   "hooks": {
     "SessionStart": [

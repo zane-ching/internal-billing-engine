@@ -25,6 +25,28 @@ wrapper, sessions emit usage with no repo tag, and it all lands in the
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | **Replace the placeholder** with your hosted receiver/collector URL (HTTPS, reachable from dev machines over VPN/network). |
 | `OTEL_METRIC_EXPORT_INTERVAL=60000` | Export once a minute — fine for billing (not real-time). |
 | `OTEL_METRICS_INCLUDE_SESSION_ID=true` | Keeps `session.id` on records (used for dedupe). |
+| `OTEL_EXPORTER_OTLP_HEADERS=X-Billing-Token=…` | **Replace the placeholder** with the fleet billing token — this is what the receiver checks on metric writes. |
+| `CLAUDE_BILLING_TOKEN=…` | Same token, read by the repo-tag hook for its `/v1/session-repo` writes. **Replace the placeholder.** |
+
+> ⚠️ **The token is a secret — do not commit the real value.** `managed-settings.json`
+> ships in git with a `REPLACE_WITH_FLEET_BILLING_TOKEN` placeholder; your MDM
+> must substitute the real value at deploy time. Generate one with
+> `openssl rand -hex 32`. On the receiver host, set the *same* value as
+> `RECEIVER_AUTH_TOKEN` (in its gitignored `.env`).
+
+### Receiver authentication — rollout order (do NOT skip)
+The receiver runs **open** until `RECEIVER_AUTH_TOKEN` is set, so enforce in this
+order or you'll drop all telemetry:
+1. Push the token to every dev machine (the two `env` keys above) via MDM, and
+   confirm sessions are still landing.
+2. Set `RECEIVER_AUTH_TOKEN` on the receiver host and restart it. It now checks
+   the token; machines already have it, so nothing breaks.
+3. Once stable, start the receiver with `--require-auth` so it refuses to boot
+   unauthenticated (guards against a future misconfig silently reopening it).
+
+To rotate: add the new token as `RECEIVER_AUTH_TOKEN`, push the same value to
+machines, then remove the old one (there's no dual-token window today, so rotate
+during a quiet period — or ask and I'll add multi-token support).
 
 ### Where the file goes (the enforced, system-level path)
 Placing it here (not in a user directory) is what makes it **enforced** —
