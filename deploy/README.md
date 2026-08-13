@@ -20,7 +20,7 @@ wrapper, sessions emit usage with no repo tag, and it all lands in the
 |---|---|
 | `CLAUDE_CODE_ENABLE_TELEMETRY=1` | Master switch: emit OpenTelemetry metrics. |
 | `OTEL_METRICS_EXPORTER=otlp` | Send metrics via OTLP (this is what carries `claude_code.token.usage`). |
-| `OTEL_LOGS_EXPORTER=none` | Billing needs metrics only — don't ship event logs (less traffic, less data exposure). |
+| *(no `OTEL_LOGS_EXPORTER`)* | Billing needs metrics only — don't ship event logs (less traffic, less data exposure). Leave this **unset**: with it unset Claude Code exports no logs, which is exactly what we want. Do **not** set `OTEL_LOGS_EXPORTER=none` — Claude Code's logs exporter only handles `otlp` and `console`, so `none` is unrecognized and makes it error on startup and exit. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` | Matches the billing receiver. If you front the receiver with an OpenTelemetry Collector, you can switch to the more efficient `http/protobuf`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | **Replace the placeholder** with your hosted receiver/collector URL (HTTPS, reachable from dev machines over VPN/network). |
 | `OTEL_METRIC_EXPORT_INTERVAL=60000` | Export once a minute — fine for billing (not real-time). |
