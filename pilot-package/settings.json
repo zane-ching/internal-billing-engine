@@ -1,0 +1,21 @@
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_METRICS_EXPORTER": "otlp",
+    "OTEL_LOGS_EXPORTER": "none",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://20.83.107.157:4318",
+    "OTEL_METRIC_EXPORT_INTERVAL": "60000",
+    "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
+    "OTEL_EXPORTER_OTLP_HEADERS": "X-Billing-Token=PASTE_SHARED_TOKEN_HERE",
+    "CLAUDE_BILLING_RECEIVER": "http://20.83.107.157:4318",
+    "CLAUDE_BILLING_TOKEN": "PASTE_SHARED_TOKEN_HERE"
+  },
+  "hooks": {
+    "SessionStart":     [{ "hooks": [{ "type": "command", "command": "REPLACE_WITH_HOOK_PATH" }] }],
+    "CwdChanged":       [{ "hooks": [{ "type": "command", "command": "REPLACE_WITH_HOOK_PATH" }] }],
+    "DirectoryAdded":   [{ "hooks": [{ "type": "command", "command": "REPLACE_WITH_HOOK_PATH" }] }],
+    "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "REPLACE_WITH_HOOK_PATH" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "REPLACE_WITH_HOOK_PATH", "async": true }] }]
+  }
+}
