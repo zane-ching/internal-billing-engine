@@ -6,6 +6,20 @@ attributed to the repo you were working in.
 **Opt-in and reversible.** Everything installs under your home directory, nothing
 is enforced, nothing needs administrator rights, and uninstall is one double-click.
 
+## The whole thing, in three steps
+
+1. **Unzip the folder** somewhere you'll keep it (the Verify and Uninstall
+   launchers live in it).
+2. **Double-click `Install.command`** (macOS) or **`Install.bat`** (Windows).
+   Read the notice, press **Enter**. Your OS will warn you once about a
+   downloaded file — that's expected, see below.
+3. **Check it says the receiver accepted you.** If it didn't, none of your usage
+   is being recorded — send someone the message it printed.
+
+Takes about a minute. You also need Python 3.8+ on the machine — the installer
+stops and tells you how to get it if you don't have it. Everything below this
+point is detail for when something doesn't go smoothly.
+
 ## Install
 
 Unzip the folder somewhere, then double-click one file:

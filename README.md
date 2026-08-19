@@ -4,8 +4,92 @@ Backend engine to obtain Claude Code usage data and its link with its associated
 
 Can run locally because of .claude > settings.local.json, settings (deploy/) will have to be pushed to all dev machines in order for global telemetry to be captured.
 
+No third-party Python dependencies — standard library only, Python 3.10+. Nothing
+to `pip install`.
+
+---
+
+## Quick start
+
+**Which one are you?**
+
+| You want to… | Go to |
+|---|---|
+| Enrol *your own* machine (opt-in, one click) | [`client-package/INSTRUCTIONS.md`](client-package/INSTRUCTIONS.md) |
+| Send the package to developers | [`client-package/ADMIN.md`](client-package/ADMIN.md) |
+| Push telemetry to the whole fleet via MDM | [`deploy/README.md`](deploy/README.md) |
+| Run the receiver / produce invoices | below |
+| Turn the pushed CSVs into Fabric tables | [`fabric/README.md`](fabric/README.md) |
+
+### Run the whole pipeline locally (~5 minutes, no Docker, no Azure, no config)
+
+Proves the chain end to end on one machine before any of it touches a fleet.
+Nothing here needs a `.env` — the receiver runs open on localhost, which is the
+one place that's fine.
+
+Use `python3` on macOS/Linux, `python` on Windows.
+
+> **Windows, two one-time gotchas.** Set `PYTHONUTF8=1` first — the reporting
+> commands print `⚠` and `→`, which crash with `UnicodeEncodeError` on a cp1252
+> console. And if `python` opens the Microsoft Store instead of running, that's the
+> App Execution Alias stub, not a Python: install a real one with
+> `winget install --id Python.Python.3.12 --scope user`, or just use
+> `.\deploy\start-local.ps1`, which finds the real interpreter itself.
+>
+> ```powershell
+> $env:PYTHONUTF8 = "1"
+> ```
+
+```bash
+# 1. Start the receiver. Leave it running; open a second terminal for the rest.
+python3 -m billing.otel.receiver
+#    Windows alternative (finds Python for you):  .\deploy\start-local.ps1 -Open
+
+# 2. Push synthetic telemetry through it — six sessions, five repos, one with no
+#    git remote, and two that are the same repo written two ways.
+python3 -m billing.otel.sample_payload
+
+# 3. See what it made of them.
+python3 -m billing.otel.bill                                      # per-repo totals + attribution
+python3 -m billing.otel.invoice --start 2026-07-01 --end 2026-08-01
+```
+
+The sample data is stamped **2026-07-14**, so the invoice window above is the one
+that returns rows — an empty invoice usually means the dates missed the data, not
+that ingest failed. Invoices land in `invoices/`, the store in `data/otel.db`.
+
+To exercise the auth path too, put a token in `.env` and restart the receiver with
+`--require-auth`. Note that `sample_payload.py` sends no token, so it will get a
+`401` against an enforcing receiver — that's the expected result, and it's the
+quickest way to confirm enforcement is actually on. Use a real Claude Code session
+(below) to generate authenticated traffic.
+
+### Run the receiver for real (Docker)
+
+```bash
+cp .env.example .env        # set RECEIVER_AUTH_TOKEN; add ADLS_*/AZURE_* to sync to the lake
+docker compose up -d --build
+docker compose logs -f receiver     # should print: auth=ENABLED
+```
+
+Data persists in `./otel-data`. Two things to get right before anyone else points
+at it: put TLS in front (the Caddy sidecar is commented into
+`docker-compose.yml`), and set `RECEIVER_AUTH_TOKEN` — `auth=DISABLED` in that log
+line means anyone who can reach the port can write billing rows.
+
+### Feed it your own usage instead of synthetic data
+
+`.claude/settings.local.json` (gitignored) points this machine at a local receiver,
+so a `claude` session in this repo produces real rows. `deploy/dev-selftest.sh` does
+the same as a one-off launcher without changing your settings. Telemetry starts with
+the **next** session, and exports every 60s — so give it a minute before checking.
+
+---
+
 ## 1: Receiving telemetry data
-The engine gets data via an OTLP/JSON receiver (receiver.py) that ingests telemetry emitted by Claude Code on each dev machine. Deduped datapoints are stored in a single-host SQLite database. 
+The engine gets data via an OTLP/JSON receiver (receiver.py) that ingests telemetry emitted by Claude Code on each dev machine. Deduped datapoints are stored in a single-host SQLite database.
+
+The same receiver also accepts `POST /v1/session-repo` — not an OTLP endpoint, but the session→repo timeline written by the `claude-repo-tag.py` hook. Claude Code freezes `OTEL_RESOURCE_ATTRIBUTES` at launch, so the wrapper's `repo=` tag can't follow a developer who `cd`s into another client's repo mid-session; the timeline can, and `attribute.py` joins it back onto each datapoint at billing time. Writes are authenticated with a shared fleet token (`RECEIVER_AUTH_TOKEN`).
 
 ## 2: Push data to ADLS
 A scheduler (scheduler.py) regenerates two flat all-history CSVs (claudeuseagesummary, claudeusagelineitems) and enqueues them. Sync worker (fabric_sync.py) drains outbox and uploads to ADLS (rg-cyclotron-insights > sacyclotroninsights > cyclotroninsights), overwriting each file. Scheduled daily but can be modified (SYNC_FREQUENCY in .env).
@@ -23,14 +107,20 @@ Notebook in CyclotronInsights workspace in Fabric filters claudeusagelineitems b
 ```
 billing/            Python package — both pipelines + reconciliation
   otel/             the OTEL (repo-level) path
-deploy/             client-side config pushed to dev machines (MDM)
+deploy/             client-side config pushed to dev machines (MDM, enforced)
+client-package/     opt-in, one-click installer developers run themselves
+pilot-package/      the earlier opt-in package — superseded by client-package/
 fabric/             Fabric-side notebook + docs (CSV → Delta tables)
 data/               generated SQLite stores + logs (gitignored)
 .claude/            local Claude Code settings (gitignored)
 Dockerfile          container image for the receiver
 docker-compose.yml  receiver + sync worker services
-DEMO.md             end-to-end demo runbook
 ```
+
+There are **two enrolment tracks** onto the same receiver: the enforced MDM track
+(`deploy/`) and the opt-in double-click track (`client-package/`). They install the
+same hook and the same telemetry env; they differ only in who applies it and
+whether a developer can remove it.
 
 ### `billing/` — the engine
 
@@ -52,14 +142,15 @@ Shared:
 
 ### `billing/otel/` — the OTEL (repo-level) path
 
-- **`receiver.py`** — minimal OTLP/JSON HTTP server. Accepts `claude_code.token.usage` from Claude Code (handles chunked + gzip bodies), extracts repo/user/model/token-type, dedupes, writes to the store.
-  `python -m billing.otel.receiver`
-- **`otel_store.py`** — SQLite store: deduped `token_usage` datapoints, persisted invoices, the optional `repo_name_map` override table, and the `fabric_outbox` delivery queue.
+- **`receiver.py`** — minimal OTLP/JSON HTTP server. Accepts `claude_code.token.usage` and `claude_code.cost.usage` from Claude Code (handles chunked + gzip bodies), extracts repo/user/model/token-type, dedupes, writes to the store. Also accepts `POST /v1/session-repo` from the repo-tag hook. Every POST must present the shared fleet token (`X-Billing-Token` or `Authorization: Bearer`) once `RECEIVER_AUTH_TOKEN` is set; unset means open, with a loud startup warning.
+  `python -m billing.otel.receiver` (`--host`, `--port`, `--db`, `--require-auth`)
+- **`attribute.py`** — resolves *which repo a datapoint bills to*, at query time. Joins the `session_repo_timeline` onto each datapoint as-of its own timestamp, so a session that moved between repos splits across them. Falls back through `timeline → wrapper → no_remote → absent`, and exposes that choice as `attribution_source` so you can see which signal is carrying the bill. Resolution is derived, never stored: a late or corrected timeline retroactively fixes past bills with no re-ingest.
+- **`otel_store.py`** — SQLite store: deduped `token_usage` and `cost_usage` datapoints, the `session_repo_timeline`, persisted invoices + line items, the optional `repo_name_map` override table, and the `fabric_outbox` delivery queue.
 - **`normalize.py`** — collapses git remote forms (ssh vs https, `.git`, case) into one canonical repo key so a repo isn't billed twice, and derives the short repo name (`repo_name`) that is the billing identity.
 - **`repos.py`** — manage the OPTIONAL repo→billing-name override map: `export` observed repos to CSV, edit the `bill_name` column to rename/group a repo, then `import`. Not needed by default — every repo bills under its own name.
   `python -m billing.otel.repos export --out repo_name_map.csv`
 - **`rating.py`** — `RatingService`: token counts → billable USD (per-model rates × markup, cache-token multipliers) RATES ARE PLACEHOLDERS AND NEED TO BE REPLACED W/ REAL PRICES
-- **`bill.py`** — aggregates usage → repo, bills on actual cost (`claude_code.cost.usage`) × markup with a rate-card cross-check; flags `unknown` usage (sessions with no git remote). `python -m billing.otel.bill`
+- **`bill.py`** — aggregates usage → repo, bills on actual cost (`claude_code.cost.usage`) × markup with a rate-card cross-check; flags `unknown` usage (sessions with no git remote) and prints an **ATTRIBUTION SOURCE** breakdown plus every multi-repo session. `python -m billing.otel.bill`
 - **`invoice.py`** — generates per-repo invoices for a billing period: persists immutable invoice + line-item records and writes a human-readable `.txt` invoice + `summary.csv` / `line_items.csv` under `invoices/`. `python -m billing.otel.invoice --start 2026-07-01 --end 2026-08-01`
 - **`records.py`** — dumps individual usage records with their repo tag + resolved billing name.
 - **`sample_payload.py`** — generates a synthetic OTLP payload to exercise the pipeline without live machines.
@@ -70,17 +161,56 @@ Shared:
 - **`fabric_sync.py`** — drains the delivery outbox: ships queued CSVs with retry/backoff. `python -m billing.otel.fabric_sync` (run-once; `--watch`, `--status`, `--dry-run`).
 - **`scheduler.py`** — the periodic sync job: regenerate the current month (month-to-date) and ship it, at the cadence in `SYNC_FREQUENCY` (hourly/daily/weekly/monthly). `python -m billing.otel.scheduler` (once; `--loop`, `--emit-cron`, `--month` backfill).
 
-### `deploy/` — client-side rollout (pushed via MDM)
+### `deploy/` — client-side rollout (pushed via MDM, enforced)
 
-- **`managed-settings.json`** — enforces telemetry ON + the exporter endpoint.
-  Placed at the system-level managed-settings path so developers can't disable it.
+- **`managed-settings.json`** — enforces telemetry ON, the exporter endpoint, the
+  fleet billing token, and the repo-tag hook registration. Placed at the
+  system-level managed-settings path so developers can't disable it. Ships with
+  `REPLACE_WITH_FLEET_BILLING_TOKEN` placeholders — MDM substitutes the real
+  token at deploy time; **never commit the real value.**
 - **`claude-wrapper.sh`** — the `claude` entrypoint on each machine; stamps every
-  session with `OTEL_RESOURCE_ATTRIBUTES=repo=<git remote>`.
+  session with `OTEL_RESOURCE_ATTRIBUTES=repo=<git remote>` at launch.
+- **`claude-repo-tag.py`** — the hook that keeps attribution correct *during* a
+  session. Fires on `SessionStart`, `CwdChanged`, `DirectoryAdded`, `SessionEnd`
+  and (async) `UserPromptSubmit`, POSTing one timeline entry per repo change to
+  `/v1/session-repo`. Unlike the wrapper it runs on **every** Claude Code surface,
+  not just the CLI. Designed never to break a session: always exits 0.
 - **`dev-selftest.sh`** — scoped launcher to generate real telemetry from one
   machine into a local receiver (for testing before a fleet rollout).
+- **`start-local.ps1`** — runs the receiver directly on a Windows host, no Docker.
+  `.\deploy\start-local.ps1 [-Port 4318] [-BindAll] [-Open]`
 - **`run-sync.sh`** — one-shot sync wrapper for cron/systemd: refresh the current
   month and ship the CSVs (the `sync` compose service runs the self-pacing loop instead).
-- **`README.md`** — deployment instructions for IT (paths, enforcement, verify).
+- **`README.md`** — deployment instructions for IT (paths, enforcement, verify,
+  troubleshooting).
+
+### `client-package/` — opt-in rollout (developers install it themselves)
+
+The distributable, double-click alternative to the MDM track — same receiver, same
+hook, no admin rights, fully reversible. Built into `client-package.zip` at the
+repo root by `build.py`, which bakes the endpoint + token into the archive so
+developers never open a terminal.
+
+- **`ADMIN.md`** — for whoever owns the rollout: how to build, how to distribute
+  (the zip carries a live token, so it *is* a credential), and what's still
+  unfinished.
+- **`INSTRUCTIONS.md`** — developer-facing: install, what's collected, verify, uninstall.
+- **`build.py`** — builds the zip and refuses to package a source file containing
+  an API key or 64-char hex token. Bump `VERSION` when anything here changes.
+- **`configure.py`** — the actual install/uninstall/verify logic, shared by both
+  platforms; merges into an existing `~/.claude/settings.json` atomically, with a
+  timestamped backup. The launchers and shims are wrappers around this — if you
+  add a platform, write another shim rather than reimplementing the merge.
+- **`Install`/`Verify`/`Uninstall` `.command` / `.bat`** — the one-click launchers
+  (macOS / Windows), wrapping `install.sh` / `install.ps1`.
+
+### `pilot-package/` — superseded
+
+The original opt-in package: bash-only, refused to touch an existing
+`~/.claude/settings.json`, and set `OTEL_LOGS_EXPORTER=none` (which Claude Code
+rejects — see `deploy/README.md`). Kept for reference. **Send anyone enrolling
+today the `client-package/` build instead**; running its installer also cleans up
+the bad key on machines that ran the pilot.
 
 ### `data/` — generated (gitignored)
 
@@ -114,25 +244,36 @@ queryable Delta tables inside Microsoft Fabric.
   `./otel-data` volume; includes a commented Caddy TLS sidecar for production.
 - **`.dockerignore`** — keeps secrets, data, and local settings out of the build context.
 
-### Demo & repo hygiene
+### Repo hygiene
 
-- **`DEMO.md`** — end-to-end demo runbook: a live Claude Code session → repo-tagged
-  telemetry → captured → per-repo invoice, plus talking points and quick fixes.
 - **`.gitignore`** — excludes secrets (`.env*`), generated data/stores, invoices,
   and personal `.claude` settings from version control.
+- **`.gitattributes`** — marks `*.zip` binary so no line-ending conversion can
+  corrupt a distributable archive on checkout. `client-package/.gitattributes`
+  additionally pins LF on the shell/Python files and CRLF on `.ps1`/`.bat`, because
+  a CRLF `install.sh` fails on macOS before it does anything.
 
 ---
 
 ## Config & secrets
 
-- **`.env`** (gitignored) — holds `ANTHROPIC_ANALYTICS_TOKEN`. Copy from
-  **`.env.example`** (which carries only a placeholder).
+- **`.env`** (gitignored) — copy from **`.env.example`** (placeholders only). Holds:
+  - `ANTHROPIC_ANALYTICS_TOKEN` — for the Analytics API path.
+  - `RECEIVER_AUTH_TOKEN` — the shared fleet token the receiver checks on every
+    POST. Must match what dev machines send (`OTEL_EXPORTER_OTLP_HEADERS` +
+    `CLAUDE_BILLING_TOKEN`). Generate with `openssl rand -hex 32`. **Blank means
+    the receiver runs open** — see the rollout order in `deploy/README.md`.
+  - `SYNC_*` / `ADLS_*` / `ONELAKE_*` / `AZURE_*` — the data-lake target and auth.
 - **`repo_name_map.csv`** — optional repo→billing-name overrides (editable working file; only needed to rename or group repos).
 
 ## Typical OTEL flow
 
 ```
-receiver.py (ingest telemetry)  →  bill  →  reconcile (coverage check)  →  invoice (per period)
+receiver.py (ingest telemetry + session→repo timeline)
+        ↓
+attribute.py (as-of join: which repo was active per datapoint)
+        ↓
+bill  →  reconcile (coverage check)  →  invoice (per period)
 
 optional, only to rename/group repos:  repos export  →  edit bill_name  →  repos import
 ```
@@ -174,8 +315,6 @@ fabric_sync → drains the outbox → uploads to ADLS Gen2 / OneLake (retry + ba
 - **Config:** set the target + auth in `.env` (see `.env.example` — `SYNC_TARGET`,
   `ADLS_*`/`ONELAKE_*`, `AZURE_*`). Unset → invoices are written locally only.
 - **Runs where `otel.db` lives** (the receiver host); SQLite is single-host.
-
-No third-party Python dependencies — standard library only.
 
 ---
 
@@ -221,13 +360,17 @@ sessions are permanently unbilled. Two viable postures:
 - **A — internal-only + always-on VPN.** No code changes; accept the coverage
   loss and measure it with `reconcile.py`.
 - **B — public HTTPS + shared bearer token** (recommended if devs work off-VPN).
-  Ship the token via `OTEL_EXPORTER_OTLP_HEADERS` in managed settings and
-  validate it in the receiver. Requires the auth work in *Harden* below.
+  The receiver already supports this: ship the token via
+  `OTEL_EXPORTER_OTLP_HEADERS` + `CLAUDE_BILLING_TOKEN` in managed settings and
+  set the same value as `RECEIVER_AUTH_TOKEN` on the host.
 
-> The receiver currently has **no authentication**. Any host that can reach
-> `:4318` can POST arbitrary token/cost datapoints into billing truth — inflating
-> or deflating a client invoice is an unauthenticated HTTP call. Fine on
-> localhost; a hard blocker for posture B.
+> **Auth is implemented but not self-enforcing.** With `RECEIVER_AUTH_TOKEN`
+> unset the receiver accepts *anything* that can reach `:4318` — arbitrary
+> token/cost rows into billing truth, over plain HTTP. It warns loudly at startup,
+> but a warning in a log is not a control. Set the token, then start with
+> `--require-auth` so a future misconfiguration can't silently reopen it. The
+> token authenticates a *machine*, not a user: it stops outsiders, not a holder
+> of the token forging rows.
 
 ### Does this consume developer machine capacity?
 
@@ -269,9 +412,10 @@ building policy on it.
 1. Provision the VM; attach and mount a managed disk for `otel-data`.
 2. Clone to `/opt/cyclotron/internal-billing-engine` (the path
    `scheduler --emit-cron` already prints).
-3. Fill `.env` from `.env.example`: `SYNC_TARGET=adls`, `SYNC_AUTH=sp`, the
-   `ADLS_*` values, and the `AZURE_*` service principal. Grant that SP
-   **Storage Blob Data Contributor** on the container.
+3. Fill `.env` from `.env.example`: `RECEIVER_AUTH_TOKEN` (`openssl rand -hex 32`),
+   `SYNC_TARGET=adls`, `SYNC_AUTH=sp`, the `ADLS_*` values, and the `AZURE_*`
+   service principal. Grant that SP **Storage Blob Data Contributor** on the
+   container.
 4. Enable TLS — uncomment the Caddy sidecar in `docker-compose.yml` and point DNS
    at the VM. Dev machines hit `https://`, never raw `:4318`.
 5. `docker compose up -d --build`; verify with `billing.otel.sample_payload`
@@ -281,6 +425,11 @@ building policy on it.
    fleet traffic is miserable.
 
 ### Phase 2 — Pilot (1–2 weeks, 5–10 volunteers)
+
+Enrol volunteers with the opt-in package rather than MDM — build it once
+(`python3 client-package/build.py --endpoint https://… --token <TOKEN>`) and send
+the zip; they double-click `Install`. See `client-package/ADMIN.md` for how to
+distribute it, and note the built zip contains a live token.
 
 The pilot exists to produce numbers that cannot be estimated:
 
@@ -298,8 +447,11 @@ client.** Invoices will be built on it.
 
 ### Phase 3 — Harden (during the pilot, in this order)
 
-1. **Receiver authentication.** Validate a bearer token in `do_POST` before
-   ingesting. Blocking for a public endpoint; ~10 lines regardless.
+1. ~~**Receiver authentication.**~~ **Done** — `do_POST` validates a shared token
+   (constant-time) before reading the body. What's left is *enforcement*: set
+   `RECEIVER_AUTH_TOKEN` on the host and restart with `--require-auth`, in the
+   order given in `deploy/README.md` so you don't drop telemetry mid-rollout.
+   Still open: there's no dual-token window, so rotation needs a quiet period.
 2. **Concurrency.** Serial handling queues under fleet load. Moving to
    `ThreadingHTTPServer` *also* requires fixing the store — `check_same_thread=False`
    plus a write lock (or a connection per thread) — and `PRAGMA journal_mode=WAL`
@@ -330,7 +482,12 @@ Postgres.
 Push via MDM in waves (10% → 50% → 100%), watching receiver load and the
 `unknown` rate at each step:
 
-1. `managed-settings.json` to the system path for each OS.
+**Three artifacts, not two** — `managed-settings.json`, `claude-wrapper.sh`, and
+`claude-repo-tag.py`. The hook is what keeps a mid-session repo switch from
+billing to the wrong client, and it is the only one that covers non-CLI surfaces.
+
+1. `managed-settings.json` to the system path for each OS, with the real fleet
+   token substituted for the placeholders.
 2. Real binary at `/opt/cyclotron/claude-real`, `claude-wrapper.sh` as the only
    `claude` on PATH, and **`CLAUDE_REAL_BIN` pinned** — auto-discovery exists, but
    across Homebrew/npm/nvm installs PATH-order guessing is how you get a wrapper
@@ -340,10 +497,17 @@ Push via MDM in waves (10% → 50% → 100%), watching receiver load and the
    `env` to itself, and the wrapper is its parent process, so it never sees it.
    Ship **one copy** of the wrapper per machine (symlinks are fine); two copies
    used to exec each other and hang the session. See `deploy/README.md`.
-3. **Both artifacts together.** Settings without the wrapper is the worst
-   outcome: it looks like success while being entirely unbillable.
-4. Verify per wave using `deploy/README.md`, and confirm the managed-settings path
+3. `claude-repo-tag.py` to `/opt/cyclotron/claude-repo-tag.py`, executable, with
+   the path matching what `managed-settings.json` registers. Needs `python3` on
+   the PATH.
+4. **All three together.** Settings without the wrapper is the worst outcome: it
+   looks like success while being entirely unbillable. Wrapper without the hook
+   bills mid-session repo switches to the wrong client — which is worse than not
+   billing, because it's wrong rather than missing.
+5. Verify per wave using `deploy/README.md`, and confirm the managed-settings path
    against the installed Claude Code version rather than trusting the table.
+   `bill.py`'s ATTRIBUTION SOURCE breakdown is the fastest read on whether the
+   hook actually landed: all-`wrapper` means it didn't.
 
 ### Phase 5 — Schedule the sync
 
@@ -438,6 +602,11 @@ Two answers change the plan materially:
 
 - **Fleet size + peak concurrent sessions** — decides SQLite-plus-hardening vs.
   Collector-plus-Postgres, a very different Phase 3.
-- **Do developers work off-VPN?** — decides whether receiver auth is a
-  nice-to-have or a Phase 1 blocker, and how much coverage loss the pilot should
-  be expected to reveal.
+- **Do developers work off-VPN?** — decides whether the endpoint is internal-only
+  or public HTTPS, and how much coverage loss the pilot should be expected to
+  reveal. Auth exists either way; a public endpoint makes enforcing it
+  (`--require-auth`) and TLS non-negotiable rather than merely advisable.
+- **Enforced or opt-in?** — MDM (`deploy/`) removes the coverage question but
+  needs the HR/legal notice in Phase 0.3 first; the opt-in package
+  (`client-package/`) ships today but leaves coverage voluntary, so
+  `reconcile.py` becomes the number that matters.

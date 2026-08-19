@@ -1,5 +1,24 @@
 # Claude Code usage-billing pilot — setup (opt-in)
 
+> # ⚠️ Superseded — do not send this to anyone
+>
+> Use **`client-package/`** instead: developers double-click one file, it works on
+> Windows as well as macOS, and it merges into an existing `~/.claude/settings.json`
+> instead of refusing to run. See [`../client-package/ADMIN.md`](../client-package/ADMIN.md).
+>
+> This folder is kept for reference only. Two concrete reasons not to use it:
+>
+> - Its `settings.json` sets `OTEL_LOGS_EXPORTER=none`. Claude Code's logs exporter
+>   only accepts `otlp` and `console`, so `none` is unrecognised and makes it
+>   **error on startup and exit**. The client package omits the key and removes it
+>   from machines that ran this pilot.
+> - The install below **refuses to run** if you already have a
+>   `~/.claude/settings.json` — which most developers do — and hands them a manual
+>   JSON merge. That is a support ticket per developer at any real scale.
+>
+> **If you ran this pilot:** just run the client package installer. It cleans up
+> after this one; there is nothing to uninstall first.
+
 - points your Claude Code session at an internal receiver so your usage can be attributed to the repo
 - opt-in and fully reversible — everything installs into your home directory, nothing is enforced, and uninstalling is deleting two files
 
