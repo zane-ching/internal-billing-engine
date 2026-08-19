@@ -1,0 +1,5 @@
+# Distributable archives live at the repo root. Mark them binary so no
+# line-ending conversion can ever corrupt the archive on checkout.
+# (Git usually auto-detects binary content, but for a file developers download
+# and run, being explicit is worth the one line.)
+*.zip binary
