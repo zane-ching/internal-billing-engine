@@ -11,6 +11,10 @@
 #
 # Everything installs under your home directory. Nothing is enforced and
 # nothing runs as root. See INSTRUCTIONS.md.
+#
+# If billing-config.json sits next to this script, --token and --endpoint are
+# optional and the packaged values are used. That is how Install.command runs
+# with no arguments; most people should just double-click that instead.
 
 set -euo pipefail
 

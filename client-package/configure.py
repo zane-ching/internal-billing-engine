@@ -11,6 +11,16 @@ logic exists exactly once instead of being reimplemented per shell.
 
 Stdlib only, Python 3.8+ (macOS system python3 is 3.9).
 
+ONE-CLICK MODE
+  If `billing-config.json` sits next to this file, the endpoint and token are
+  read from it and both flags become optional - that is what makes the
+  double-clickable launchers (Install.command / Install.bat) work with no
+  arguments at all. `build.py` stamps that file into the zip; it is never
+  committed. Explicit flags still win over the baked values.
+
+  A packaged config carries a live token, so the built zip IS a credential.
+  See ADMIN.md before you decide how to distribute it.
+
 WHY THIS EXISTS AND pilot-package/install.sh DOES NOT SUFFICE
   * install.sh refuses to touch an existing ~/.claude/settings.json and tells the
     developer to hand-merge JSON. Most developers already have that file, so at
@@ -38,6 +48,7 @@ import urllib.error
 import urllib.request
 
 HOOK_NAME = "claude-repo-tag.py"
+CONFIG_NAME = "billing-config.json"
 HOOK_EVENTS = ("SessionStart", "CwdChanged", "DirectoryAdded", "SessionEnd",
                "UserPromptSubmit")
 # UserPromptSubmit re-tags on every prompt so a single missed delivery
@@ -63,6 +74,62 @@ OWNED_ENV_KEYS = (
 # --------------------------------------------------------------------------
 # paths
 # --------------------------------------------------------------------------
+
+def package_dir() -> str:
+    """The unpacked package directory - where this script and its siblings live."""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def load_baked_config() -> dict:
+    """Read `billing-config.json` from the package, if the build stamped one in.
+
+    Absent file is the normal case for a source checkout and for a zip built with
+    `--no-config`; it just means the flags are required. A present-but-broken file
+    is fatal - silently falling back to "no endpoint" would turn a typo in the
+    build into a confusing "--endpoint is required" for every developer.
+    """
+    path = os.path.join(package_dir(), CONFIG_NAME)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            obj = json.load(fh)
+    except ValueError as e:
+        raise SystemExit("%s is not valid JSON (%s) - rebuild the package." % (path, e))
+    if not isinstance(obj, dict):
+        raise SystemExit("%s must contain a JSON object." % path)
+    return obj
+
+
+COLLECTION_NOTICE = """
+This configures Claude Code to report usage to your company's billing receiver.
+
+  Collected:     the git remote of the repo you work in, the model, token counts
+                 and cost, your work email, a session id, and timestamps.
+  Not collected: your prompts, your code, file contents, or file paths.
+
+It installs under your home directory only, needs no administrator rights, and
+is reversible - see INSTRUCTIONS.md, or run the Uninstall launcher.
+"""
+
+
+def confirm_or_exit() -> None:
+    """Show what is collected and take one keystroke before writing anything.
+
+    The launchers are double-clicked, so this is the only point at which someone
+    who opened the wrong file can back out. If stdin is not a terminal (piped or
+    scripted install) there is nobody to ask, so proceed.
+    """
+    print(COLLECTION_NOTICE)
+    if not sys.stdin or not sys.stdin.isatty():
+        return
+    try:
+        answer = input("Press Enter to install, or type n and press Enter to cancel: ")
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit("\nCancelled - nothing was changed.")
+    if answer.strip().lower().startswith("n"):
+        raise SystemExit("Cancelled - nothing was changed.")
+
 
 def home() -> str:
     return os.path.expanduser("~")
@@ -115,7 +182,9 @@ def hook_command() -> str:
 def validate_endpoint(url: str, allow_insecure: bool) -> str:
     url = (url or "").strip().rstrip("/")
     if not url:
-        raise SystemExit("--endpoint is required (e.g. https://otel-billing.internal.example.com:4318)")
+        raise SystemExit(
+            "No receiver endpoint. This package has no %s baked in, so pass one:\n"
+            "    --endpoint https://otel-billing.internal.example.com:4318" % CONFIG_NAME)
     if not re.match(r"^https?://", url):
         raise SystemExit("--endpoint must start with https:// (or http:// with --allow-insecure): %r" % url)
     if url.startswith("http://") and not allow_insecure:
@@ -132,7 +201,9 @@ def validate_endpoint(url: str, allow_insecure: bool) -> str:
 def validate_token(token: str) -> str:
     token = (token or "").strip()
     if not token:
-        raise SystemExit("--token is required. Get it from the billing owner over 1Password.")
+        raise SystemExit(
+            "No token. This package has no %s baked in, so pass one:\n"
+            "    --token <TOKEN>   (get it from the billing owner)" % CONFIG_NAME)
     if token.startswith("PASTE_") or token.startswith("REPLACE_"):
         raise SystemExit("--token is still the placeholder %r - paste the real token." % token)
     if len(token) < 16:
@@ -144,17 +215,28 @@ def mask(token: str) -> str:
     return (token[:6] + "..." + token[-4:]) if len(token) > 12 else "..."
 
 
+def _hint(launcher: str, command: str) -> str:
+    """Name the double-clickable launcher when the package ships one, else the CLI.
+
+    A developer who got here by double-clicking should be told to double-click
+    something, not handed a shell incantation.
+    """
+    if os.path.exists(os.path.join(package_dir(), launcher)):
+        return "double-click %s (in this folder)" % launcher
+    return command
+
+
 def uninstall_hint() -> str:
-    """The uninstall command for the platform the developer is actually on."""
+    """The uninstall step for the platform the developer is actually on."""
     if os.name == "nt":
-        return ".\\install.ps1 -Uninstall"
-    return "bash install.sh uninstall"
+        return _hint("Uninstall.bat", ".\\install.ps1 -Uninstall")
+    return _hint("Uninstall.command", "bash install.sh uninstall")
 
 
 def verify_hint() -> str:
     if os.name == "nt":
-        return ".\\install.ps1 -Verify -Endpoint <RECEIVER_URL>"
-    return "bash install.sh verify --endpoint <RECEIVER_URL>"
+        return _hint("Verify.bat", ".\\install.ps1 -Verify -Endpoint <RECEIVER_URL>")
+    return _hint("Verify.command", "bash install.sh verify --endpoint <RECEIVER_URL>")
 
 
 # --------------------------------------------------------------------------
@@ -318,9 +400,18 @@ def verify(endpoint: str, token: str, timeout: float = 5.0) -> bool:
 # --------------------------------------------------------------------------
 
 def cmd_install(args) -> int:
-    endpoint = validate_endpoint(args.endpoint, args.allow_insecure)
-    token = validate_token(args.token)
+    cfg = load_baked_config()
+    # Explicit flags beat the baked values, so an admin can retarget a packaged
+    # zip at a staging receiver without rebuilding it.
+    endpoint = validate_endpoint(
+        args.endpoint or cfg.get("endpoint", ""),
+        args.allow_insecure or bool(cfg.get("allow_insecure", False)))
+    token = validate_token(args.token or cfg.get("token", ""))
     py = interpreter()
+
+    if args.interactive:
+        confirm_or_exit()
+        print("")
 
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)), HOOK_NAME)
     if not os.path.exists(src):
@@ -333,6 +424,8 @@ def cmd_install(args) -> int:
     print("  token       %s" % mask(token))
     print("  settings    %s" % settings_path())
     print("  hook        %s" % hook_path())
+    if cfg and not (args.endpoint and args.token):
+        print("  source      %s (baked into this package)" % CONFIG_NAME)
 
     if args.dry_run:
         print("\n--dry-run: nothing written.")
@@ -426,14 +519,23 @@ def cmd_uninstall(args) -> int:
 
 
 def cmd_verify(args) -> int:
-    endpoint = validate_endpoint(args.endpoint, True)
+    cfg = load_baked_config()
+    endpoint = validate_endpoint(args.endpoint or cfg.get("endpoint", ""), True)
     token = (args.token or "").strip()
     if not token:
+        # Prefer what is actually installed - verifying the machine's real
+        # configuration is the point. Fall back to the packaged value.
         obj, _ = read_settings(settings_path())
         token = (obj.get("env") or {}).get("CLAUDE_BILLING_TOKEN", "")
-        if not token:
-            raise SystemExit("No --token given and none found in settings.json.")
-        print("Using token from %s" % settings_path())
+        if token:
+            print("Using token from %s" % settings_path())
+        else:
+            token = (cfg.get("token") or "").strip()
+            if not token:
+                raise SystemExit(
+                    "No --token given, none in settings.json, and no %s in this "
+                    "package." % CONFIG_NAME)
+            print("Using token baked into this package (%s)" % CONFIG_NAME)
     print("Verifying %s with token %s:" % (endpoint, mask(token)))
     return 0 if verify(endpoint, token) else 1
 
@@ -443,11 +545,17 @@ def main() -> int:
         description="Install the Claude Code usage-billing client config.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    # --token/--endpoint are optional: a packaged zip carries billing-config.json
+    # and the launchers pass no arguments at all. Missing in both places is
+    # caught by validate_* with a message that says so.
     p = sub.add_parser("install")
-    p.add_argument("--token", required=True)
-    p.add_argument("--endpoint", required=True)
+    p.add_argument("--token", default="")
+    p.add_argument("--endpoint", default="")
     p.add_argument("--allow-insecure", action="store_true",
                    help="permit a plaintext http:// endpoint (not for fleet use)")
+    p.add_argument("--interactive", action="store_true",
+                   help="show what is collected and wait for a keystroke first "
+                        "(used by the double-click launchers)")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_install)
 
@@ -456,7 +564,7 @@ def main() -> int:
     p.set_defaults(func=cmd_uninstall)
 
     p = sub.add_parser("verify")
-    p.add_argument("--endpoint", required=True)
+    p.add_argument("--endpoint", default="")
     p.add_argument("--token", default="")
     p.set_defaults(func=cmd_verify)
 

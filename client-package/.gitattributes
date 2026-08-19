@@ -6,10 +6,14 @@
 *.sh        text eol=lf
 *.py        text eol=lf
 *.md        text eol=lf
+*.command   text eol=lf
 VERSION     text eol=lf
 
 # PowerShell is fine with either; CRLF is native on the platform that runs it.
 *.ps1       text eol=crlf
+# Batch files are read by cmd.exe, which is not reliable about LF-only input -
+# labels and multi-line blocks are the usual casualties.
+*.bat       text eol=crlf
 
 # Never touch the built archive.
 *.zip       binary

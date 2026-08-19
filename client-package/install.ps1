@@ -8,6 +8,10 @@
 # settings merge. Everything installs under your user profile; nothing needs
 # administrator rights. See INSTRUCTIONS.md.
 #
+# If billing-config.json sits next to this script, -Token and -Endpoint are
+# optional - the packaged values are used. That is how Install.bat runs with no
+# arguments; most people should just double-click that instead of running this.
+#
 # If PowerShell blocks the script, run it for this session only:
 #     powershell -ExecutionPolicy Bypass -File .\install.ps1 -Token ... -Endpoint ...
 
@@ -19,6 +23,9 @@ param(
     [switch] $Verify,
     # Permit a plaintext http:// endpoint. Not for fleet use.
     [switch] $AllowInsecure,
+    # Print what is collected and wait for a keystroke before writing anything.
+    # Install.bat passes this, because a double-click has no other way to stop.
+    [switch] $Interactive,
     [switch] $DryRun
 )
 
@@ -68,19 +75,33 @@ if (-not (Test-Path $configure)) {
     exit 1
 }
 
+# A packaged zip carries the endpoint and token, so the flags become optional.
+# configure.py reads the file itself; this only decides whether to fail early
+# with a readable message.
+$baked = Test-Path (Join-Path $srcDir 'billing-config.json')
+
 # Build the argument list for configure.py.
 if ($Uninstall) {
     $callArgs = @($configure, 'uninstall')
     if ($DryRun) { $callArgs += '--dry-run' }
 } elseif ($Verify) {
-    if (-not $Endpoint) { Write-Host 'Verify needs -Endpoint.' -ForegroundColor Red; exit 1 }
-    $callArgs = @($configure, 'verify', '--endpoint', $Endpoint)
-    if ($Token) { $callArgs += @('--token', $Token) }
+    if (-not $Endpoint -and -not $baked) {
+        Write-Host 'Verify needs -Endpoint (this package has no billing-config.json).' -ForegroundColor Red
+        exit 1
+    }
+    $callArgs = @($configure, 'verify')
+    if ($Endpoint) { $callArgs += @('--endpoint', $Endpoint) }
+    if ($Token)    { $callArgs += @('--token', $Token) }
 } else {
-    if (-not $Token)    { Write-Host 'Install needs -Token (get it from the billing owner).' -ForegroundColor Red; exit 1 }
-    if (-not $Endpoint) { Write-Host 'Install needs -Endpoint (https://... receiver URL).'   -ForegroundColor Red; exit 1 }
-    $callArgs = @($configure, 'install', '--token', $Token, '--endpoint', $Endpoint)
+    if (-not $baked) {
+        if (-not $Token)    { Write-Host 'Install needs -Token (get it from the billing owner).' -ForegroundColor Red; exit 1 }
+        if (-not $Endpoint) { Write-Host 'Install needs -Endpoint (https://... receiver URL).'   -ForegroundColor Red; exit 1 }
+    }
+    $callArgs = @($configure, 'install')
+    if ($Token)         { $callArgs += @('--token', $Token) }
+    if ($Endpoint)      { $callArgs += @('--endpoint', $Endpoint) }
     if ($AllowInsecure) { $callArgs += '--allow-insecure' }
+    if ($Interactive)   { $callArgs += '--interactive' }
     if ($DryRun)        { $callArgs += '--dry-run' }
 }
 
