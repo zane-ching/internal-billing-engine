@@ -1,17 +1,41 @@
 # Fleet deployment (MDM) — Claude Code usage telemetry
 
-Two artifacts get pushed to every developer machine. **Both are required** —
-one turns telemetry on, the other tags it with the repo.
+> **Just enrolling a few volunteers?** Don't use this. Send them
+> `client-package.zip` instead — they double-click one file, no admin rights, no
+> MDM. See [`../client-package/ADMIN.md`](../client-package/ADMIN.md). This
+> document is the *enforced* fleet-wide track.
+
+**Three artifacts** get pushed to every developer machine. **All three are
+required** — one turns telemetry on, one tags it with the repo at launch, one
+keeps that tag correct as the developer moves between repos.
 
 | File | Job | Nature |
 |---|---|---|
-| `managed-settings.json` | Turn telemetry **ON** (enforced), point it at the billing receiver, register the hook | **Static** — same on every machine |
+| `managed-settings.json` | Turn telemetry **ON** (enforced), point it at the billing receiver, carry the fleet token, register the hook | **Static** — same on every machine |
 | `claude-wrapper.sh` | Tag each session with `repo=<git remote>` at launch | **Dynamic** — computed per session (see that file) |
 | `claude-repo-tag.py` | Record repo changes **during** a session (hook) | **Dynamic** — fires on every `cd` |
 
-`managed-settings.json` alone is necessary but **not sufficient**: without the
-wrapper, sessions emit usage with no repo tag, and it all lands in the
-`unknown` bucket — unattributable. Deploy both.
+Skipping any one of them fails in its own way:
+
+- **No wrapper** → sessions emit usage with no repo tag; it all lands in the
+  `unknown` bucket, unattributable. Settings-only looks like success while being
+  entirely unbillable.
+- **No hook** → a session that starts in one client's repo and `cd`s into
+  another's bills *all* of it to the first. That is worse than missing data,
+  because it is confidently wrong.
+
+## Setup checklist
+
+Work top to bottom; each step has its own section below.
+
+1. [ ] Generate the fleet token: `openssl rand -hex 32`. Store it once (1Password).
+2. [ ] Set it as `RECEIVER_AUTH_TOKEN` in the receiver host's `.env`, restart, confirm `auth=ENABLED` (§4).
+3. [ ] Substitute the same token into `managed-settings.json`'s two placeholders **at MDM deploy time** (§1).
+4. [ ] Push `managed-settings.json` to the system path for the OS (§1).
+5. [ ] Install the real binary at `/opt/cyclotron/claude-real`, push `claude-wrapper.sh` as the only `claude` on PATH, pin `CLAUDE_REAL_BIN` **in the shell environment** (§2).
+6. [ ] Push `claude-repo-tag.py` to `/opt/cyclotron/claude-repo-tag.py`, `chmod +x`, path matching what the settings file registers (§3).
+7. [ ] Verify on one machine before the next wave — each section has a Verify block.
+8. [ ] Once stable, restart the receiver with `--require-auth` so it can't silently reopen (§4).
 
 ## 1. managed-settings.json
 
@@ -157,8 +181,9 @@ No metric or event carries the working directory (paths are deliberately kept
 out of Claude Code's telemetry), so the repo cannot be recovered from the
 telemetry stream. A hook is the only signal that sees the transition.
 
-`claude-repo-tag.py` runs on `SessionStart`, `CwdChanged`, `DirectoryAdded`, and
-`SessionEnd`. Claude Code passes it `session_id` + `cwd` on stdin; it resolves
+`claude-repo-tag.py` runs on `SessionStart`, `CwdChanged`, `DirectoryAdded`,
+`SessionEnd`, and — asynchronously, so it never sits in the turn's critical path —
+`UserPromptSubmit`. Claude Code passes it `session_id` + `cwd` on stdin; it resolves
 the git remote and POSTs one timeline entry to `POST /v1/session-repo`. At
 billing time `billing/otel/attribute.py` joins that timeline back onto each
 usage datapoint by `session_id` + `ts` (an "as-of" join), so usage splits across
@@ -228,14 +253,26 @@ The receiver is the endpoint `OTEL_EXPORTER_OTLP_ENDPOINT` points at. It must ru
 somewhere reachable from dev machines. Containerized via the repo-root
 `Dockerfile` / `docker-compose.yml`:
 
-```
+```bash
+cp .env.example .env             # set RECEIVER_AUTH_TOKEN (openssl rand -hex 32)
 docker compose up -d --build     # from the repo root
+docker compose logs receiver     # must print: auth=ENABLED
 ```
 
 - Listens on `:4318` for OTLP/JSON; captures `claude_code.token.usage` and
-  `claude_code.cost.usage`, tagged with the repo.
+  `claude_code.cost.usage`, tagged with the repo. Also accepts the hook's
+  `POST /v1/session-repo`.
 - SQLite store + request log persist in `./otel-data` on the host.
 - Stdlib-only image (no dependencies).
+
+**`auth=DISABLED` in that log line means the receiver is open** — anything that can
+reach the port can write rows into billing truth. Fine for a localhost test, never
+for a hosted endpoint.
+
+**No Docker?** The engine is stdlib-only, so it runs directly:
+`python3 -m billing.otel.receiver --host 0.0.0.0 --require-auth`, or on Windows
+`.\deploy\start-local.ps1 -BindAll` (it locates Python for you). Only bind beyond
+localhost behind a TLS proxy.
 
 **Production hardening:**
 - **TLS** — dev machines should hit `https://…`, not raw `:4318`. Front the
