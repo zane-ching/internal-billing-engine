@@ -7,7 +7,7 @@
 
 Per Claude Code session the receiver records:
 
-- the **git remote** of the repo you're working in (e.g. `github.com/zane-ching/foo`)
+- the **git remote** of the repo you're working in (e.g. `github.com/cyclotron-azure/foo`)
 - the **model**, **token counts**, and **cost** of the usage
 - your **work email**, a **session id**, and **timestamps**
 

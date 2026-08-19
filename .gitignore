@@ -3,6 +3,11 @@
 .env.*
 !.env.example
 
+# Baked client config — holds the live billing token. build.py generates this
+# straight into the zip, so it should never appear here; the rule is a backstop
+# against a hand-written copy used for local testing.
+billing-config.json
+
 # Local data
 data/
 *.db
